@@ -26,6 +26,10 @@ KITE_API_KEY=your_kite_api_key
 KITE_API_SECRET=your_kite_api_secret
 APP_COOKIE_SECURE=false
 APP_ALLOW_HTTP_CSV=false
+TRADINGVIEW_CONFIRMATION_ENABLED=true
+TRADINGVIEW_CONFIRMATION_TTL_SECONDS=300
+STOCKRADAR_LOG_LEVEL=INFO
+STOCKRADAR_LOG_TO_FILE=true
 ```
 
 Generate `APP_SESSION_SECRET` from **cmd.exe**:
@@ -41,6 +45,7 @@ Generate it from **PowerShell**:
 ```
 
 Paste the generated value into `.env` as `APP_SESSION_SECRET`.
+Values in `.env` are loaded at app startup and override same-named variables already present in the shell or service environment.
 
 ```powershell
 python app.py --host 127.0.0.1 --port 8765
@@ -118,6 +123,53 @@ HTTP CSV loading is disabled by default for safety. Keep CSV analysis on the CLI
 ```powershell
 $env:APP_ALLOW_HTTP_CSV="true"
 ```
+
+## TradingView Extreme Confirmation
+
+StockRadar normally calculates ratings from Kite candles. To reduce TradingView traffic, the app only calls TradingView through `tradingview-ta` when all three local gauges are aligned on one side:
+
+- Oscillators is `Sell` or `Strong Sell`, Summary is `Sell` or `Strong Sell`, and Moving Averages is `Sell` or `Strong Sell`
+- Oscillators is `Buy` or `Strong Buy`, Summary is `Buy` or `Strong Buy`, and Moving Averages is `Buy` or `Strong Buy`
+
+The UI is updated only when TradingView returns the same extreme on all three groups: Summary, Oscillators, and Moving Averages must all be `STRONG_SELL`, or all three must be `STRONG_BUY`. Results are cached by symbol and timeframe to avoid repeated requests:
+
+```env
+TRADINGVIEW_CONFIRMATION_ENABLED=true
+TRADINGVIEW_CONFIRMATION_TTL_SECONDS=300
+```
+
+Increase `TRADINGVIEW_CONFIRMATION_TTL_SECONDS` if you want fewer TradingView requests during auto-refresh.
+
+## Logging
+
+StockRadar writes structured JSON logs to stdout and, by default, to:
+
+```text
+data/stockradar.log
+```
+
+Every UI/API request gets a `request_id`, with `request.start` and `request.end` events. Kite calls, option-chain calls, symbol searches, TradingView confirmations, login attempts, redirects, and errors are logged with timings.
+The same id is returned in the `X-Request-ID` response header.
+
+Configure logging in `.env`:
+
+```env
+STOCKRADAR_LOG_LEVEL=INFO
+STOCKRADAR_LOG_TO_FILE=true
+STOCKRADAR_LOG_FILE=D:\StockRadarData\stockradar.log
+```
+
+Use `DEBUG` only while troubleshooting because auto-refresh can create many log lines.
+
+If you run with redirected output, logs are written to stdout and to the file above. Older deployments may still show logs in `server.err.log`; restart after pulling this version to move stream logs to stdout.
+
+To verify logging after deployment, open the app and then request:
+
+```text
+/api/health
+```
+
+You should see `request.start`, `health.success`, and `request.end` entries in the log file.
 
 ## Accuracy Notes
 

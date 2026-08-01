@@ -6,9 +6,11 @@ import difflib
 import hmac
 import html
 import json
+import logging
 import os
 import re
 import secrets
+import sys
 import tempfile
 import threading
 import time
@@ -20,6 +22,12 @@ from pathlib import Path
 
 import pandas as pd
 from kiteconnect import KiteConnect
+try:
+    from tradingview_ta import Interval as TVInterval
+    from tradingview_ta import TA_Handler
+except ImportError:  # Optional production confirmation layer.
+    TVInterval = None
+    TA_Handler = None
 
 from technical_ratings import RatingResult, technical_ratings
 
@@ -39,7 +47,7 @@ def load_env_file(path: Path = ENV_FILE) -> None:
         name, value = line.split("=", 1)
         name = name.strip()
         value = value.strip().strip('"').strip("'")
-        if name and name not in os.environ:
+        if name:
             os.environ[name] = value
 
 
@@ -56,6 +64,67 @@ SYMBOL_RE = re.compile(r"^(?:[A-Z]{2,5}:)?[A-Z0-9&.\-]{1,32}(?:\.NS)?$")
 TOKEN_LOCK = threading.RLock()
 INSTRUMENT_LOCK = threading.RLock()
 INSTRUMENT_CACHE_FRAME: pd.DataFrame | None = None
+REQUEST_CONTEXT = threading.local()
+TV_CONFIRMATION_LOCK = threading.RLock()
+TV_CONFIRMATION_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
+TV_INTERVALS = {
+    "1m": "1m",
+    "5m": "5m",
+    "15m": "15m",
+    "30m": "30m",
+    "1h": "1h",
+    "2h": "2h",
+    "4h": "4h",
+    "1d": "1d",
+}
+
+
+LOG_FILE_PATH: Path | None = None
+
+
+def configure_logging() -> logging.Logger:
+    global LOG_FILE_PATH
+    level_name = os.environ.get("STOCKRADAR_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    log_to_file = os.environ.get("STOCKRADAR_LOG_TO_FILE", "true").lower() in {"1", "true", "yes"}
+    if log_to_file:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        log_file = Path(os.environ.get("STOCKRADAR_LOG_FILE", DATA_DIR / "stockradar.log")).resolve()
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+        LOG_FILE_PATH = log_file
+    logging.basicConfig(level=level, format="%(message)s", handlers=handlers, force=True)
+    return logging.getLogger("stockradar")
+
+
+LOGGER = configure_logging()
+
+
+def current_request_id() -> str:
+    return str(getattr(REQUEST_CONTEXT, "request_id", "") or "")
+
+
+def log_event(event: str, level: str = "info", **fields: object) -> None:
+    payload = {
+        "ts": datetime.now().isoformat(timespec="milliseconds"),
+        "event": event,
+        "request_id": current_request_id(),
+        **fields,
+    }
+    log_level = getattr(logging, level.upper(), logging.INFO)
+    LOGGER.log(log_level, json.dumps(payload, default=str, separators=(",", ":")))
+
+
+def sanitized_query(query: str) -> dict:
+    sensitive = {"request_token", "access_token", "password", "api_key", "api_secret"}
+    clean: dict[str, object] = {}
+    for key, values in urllib.parse.parse_qs(query, keep_blank_values=True).items():
+        if key.lower() in sensitive:
+            clean[key] = "<redacted>"
+        else:
+            clean[key] = values[0] if len(values) == 1 else values
+    return clean
 
 
 def disable_kite_proxy_env() -> None:
@@ -125,6 +194,19 @@ def http_csv_enabled() -> bool:
     return os.environ.get("APP_ALLOW_HTTP_CSV", "").lower() in {"1", "true", "yes"}
 
 
+def tradingview_confirmation_enabled() -> bool:
+    return os.environ.get("TRADINGVIEW_CONFIRMATION_ENABLED", "true").lower() in {"1", "true", "yes"}
+
+
+def tradingview_cache_ttl_seconds() -> int:
+    return parse_int(
+        os.environ.get("TRADINGVIEW_CONFIRMATION_TTL_SECONDS", "300"),
+        default=300,
+        minimum=60,
+        maximum=3600,
+    )
+
+
 def safe_error_html(title: str, message: object) -> str:
     return f"<h1>{html.escape(title)}</h1><p>{html.escape(str(message))}</p>"
 
@@ -156,9 +238,11 @@ def verify_session_cookie(value: str) -> bool:
 
 
 def fetch_kite_ohlcv(symbol: str, interval: str = "1d", range_: str = "2y") -> pd.DataFrame:
+    started = time.perf_counter()
     symbol = validate_symbol(symbol)
     interval = validate_interval(interval)
     range_ = validate_range(range_)
+    log_event("kite.ohlcv.start", symbol=symbol, interval=interval, range=range_)
     api_key = os.environ.get("KITE_API_KEY", "").strip()
     access_token = current_kite_access_token()
     if not api_key:
@@ -174,16 +258,38 @@ def fetch_kite_ohlcv(symbol: str, interval: str = "1d", range_: str = "2y") -> p
     instrument_token = get_kite_instrument_token(exchange, tradingsymbol)
     source_interval = kite_source_interval(interval)
     from_dt, to_dt = kite_date_window(interval, range_)
-    chunks = fetch_kite_historical_chunks(
-        api_key, access_token, instrument_token, source_interval, from_dt, to_dt
-    )
-    if not chunks:
-        raise ValueError(f"No Kite candles returned for {exchange}:{tradingsymbol}.")
+    try:
+        chunks = fetch_kite_historical_chunks(
+            api_key, access_token, instrument_token, source_interval, from_dt, to_dt
+        )
+        if not chunks:
+            raise ValueError(f"No Kite candles returned for {exchange}:{tradingsymbol}.")
 
-    df = pd.concat(chunks, ignore_index=True).drop_duplicates(subset=["Date"]).sort_values("Date")
-    if interval in {"2h", "4h", "1wk", "1mo"}:
-        return resample_ohlcv(df, interval)
-    return df.reset_index(drop=True)
+        df = pd.concat(chunks, ignore_index=True).drop_duplicates(subset=["Date"]).sort_values("Date")
+        if interval in {"2h", "4h", "1wk", "1mo"}:
+            df = resample_ohlcv(df, interval)
+        else:
+            df = df.reset_index(drop=True)
+        log_event(
+            "kite.ohlcv.success",
+            symbol=f"{exchange}:{tradingsymbol}",
+            interval=interval,
+            source_interval=source_interval,
+            bars=len(df),
+            chunks=len(chunks),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
+        return df
+    except Exception as exc:
+        log_event(
+            "kite.ohlcv.error",
+            "error",
+            symbol=f"{exchange}:{tradingsymbol}",
+            interval=interval,
+            error=str(exc),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
+        raise
 
 
 def current_kite_access_token() -> str:
@@ -234,12 +340,14 @@ def kite_login_url() -> str:
 
 
 def exchange_kite_request_token(request_token: str) -> dict:
+    started = time.perf_counter()
     global KITE_ACCESS_TOKEN_MEMORY
     disable_kite_proxy_env()
     api_key = os.environ.get("KITE_API_KEY", "").strip()
     api_secret = os.environ.get("KITE_API_SECRET", "").strip()
     if not api_key or not api_secret:
         raise ValueError("Missing KITE_API_KEY or KITE_API_SECRET env var.")
+    log_event("kite.login.exchange.start")
     kite = KiteConnect(api_key=api_key, timeout=20)
     payload = kite.generate_session(request_token, api_secret=api_secret)
     access_token = payload.get("access_token", "")
@@ -247,6 +355,7 @@ def exchange_kite_request_token(request_token: str) -> dict:
         raise ValueError("Kite token exchange succeeded but no access_token returned.")
     KITE_ACCESS_TOKEN_MEMORY = access_token
     save_kite_access_token(access_token)
+    log_event("kite.login.exchange.success", duration_ms=int((time.perf_counter() - started) * 1000))
     return payload
 
 
@@ -318,12 +427,23 @@ def fetch_kite_historical_chunks(
     from_dt: datetime,
     to_dt: datetime,
 ) -> list[pd.DataFrame]:
+    started = time.perf_counter()
     max_days = 60 if interval != "day" else 1900
     frames: list[pd.DataFrame] = []
     kite = kite_client(access_token)
     cursor = from_dt
+    chunk_count = 0
     while cursor < to_dt:
         end = min(cursor + timedelta(days=max_days), to_dt)
+        chunk_count += 1
+        chunk_started = time.perf_counter()
+        log_event(
+            "kite.historical.chunk.start",
+            interval=interval,
+            chunk=chunk_count,
+            from_date=cursor.isoformat(),
+            to_date=end.isoformat(),
+        )
         candles = kite.historical_data(
             instrument_token=instrument_token,
             from_date=cursor,
@@ -332,9 +452,23 @@ def fetch_kite_historical_chunks(
             continuous=False,
             oi=False,
         )
+        log_event(
+            "kite.historical.chunk.success",
+            interval=interval,
+            chunk=chunk_count,
+            candles=len(candles or []),
+            duration_ms=int((time.perf_counter() - chunk_started) * 1000),
+        )
         if candles:
             frames.append(kite_candles_to_frame(candles))
         cursor = end + timedelta(seconds=1)
+    log_event(
+        "kite.historical.success",
+        interval=interval,
+        chunks=chunk_count,
+        frames=len(frames),
+        duration_ms=int((time.perf_counter() - started) * 1000),
+    )
     return frames
 
 
@@ -375,6 +509,7 @@ def get_kite_instrument_token(exchange: str, tradingsymbol: str) -> int:
 
 
 def search_symbols(query: str, limit: int = 25) -> list[dict]:
+    started = time.perf_counter()
     limit = max(1, min(limit, 50))
     instruments = load_kite_instruments()
     stocks = instruments[
@@ -420,12 +555,22 @@ def search_symbols(query: str, limit: int = 25) -> list[dict]:
     rows.sort(key=lambda item: (-item["score"], item["tradingsymbol"]))
     for item in rows:
         item.pop("score", None)
-    return rows[:limit]
+    result = rows[:limit]
+    log_event(
+        "symbols.search.success",
+        query=query.strip().upper(),
+        limit=limit,
+        results=len(result),
+        duration_ms=int((time.perf_counter() - started) * 1000),
+    )
+    return result
 
 
 def fetch_option_chain(symbol: str, expiry: str = "", strikes_each_side: int = 8) -> dict:
+    started = time.perf_counter()
     symbol = validate_symbol(symbol)
     strikes_each_side = max(1, min(strikes_each_side, 25))
+    log_event("option_chain.start", symbol=symbol, expiry=expiry or "nearest", strikes_each_side=strikes_each_side)
     access_token = current_kite_access_token()
     if not access_token:
         raise ValueError("Kite session not connected. Open /kite/login and complete Kite login once.")
@@ -474,13 +619,22 @@ def fetch_option_chain(symbol: str, expiry: str = "", strikes_each_side: int = 8
         strike_row[side] = option_quote_payload(row, quote)
 
     rows = [by_strike[strike] for strike in sorted(by_strike)]
-    return {
+    payload = {
         "symbol": underlying,
         "spot": spot,
         "expiry": selected_expiry.isoformat(),
         "expiries": [item.isoformat() for item in future_expiries[:12]],
         "rows": rows,
     }
+    log_event(
+        "option_chain.success",
+        symbol=underlying,
+        expiry=selected_expiry.isoformat(),
+        spot=spot,
+        strikes=len(rows),
+        duration_ms=int((time.perf_counter() - started) * 1000),
+    )
+    return payload
 
 
 def kite_spot_price(underlying: str) -> float:
@@ -510,11 +664,18 @@ def best_depth_price(quote: dict, side: str) -> float | None:
 
 def load_kite_instruments() -> pd.DataFrame:
     global INSTRUMENT_CACHE_FRAME
+    started = time.perf_counter()
     with INSTRUMENT_LOCK:
         fresh_file = KITE_INSTRUMENT_CACHE.exists() and cache_age_seconds(KITE_INSTRUMENT_CACHE) <= 12 * 60 * 60
         if INSTRUMENT_CACHE_FRAME is not None and fresh_file:
+            log_event(
+                "kite.instruments.cache.memory_hit",
+                rows=len(INSTRUMENT_CACHE_FRAME),
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
             return INSTRUMENT_CACHE_FRAME.copy()
         if not fresh_file:
+            log_event("kite.instruments.fetch.start", cache_path=str(KITE_INSTRUMENT_CACHE))
             KITE_INSTRUMENT_CACHE.parent.mkdir(parents=True, exist_ok=True)
             instruments = pd.DataFrame(kite_client(access_token="").instruments())
             with tempfile.NamedTemporaryFile(
@@ -524,8 +685,18 @@ def load_kite_instruments() -> pd.DataFrame:
                 temp_name = handle.name
             Path(temp_name).replace(KITE_INSTRUMENT_CACHE)
             INSTRUMENT_CACHE_FRAME = instruments
+            log_event(
+                "kite.instruments.fetch.success",
+                rows=len(instruments),
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
             return instruments.copy()
         INSTRUMENT_CACHE_FRAME = pd.read_csv(KITE_INSTRUMENT_CACHE)
+        log_event(
+            "kite.instruments.cache.file_hit",
+            rows=len(INSTRUMENT_CACHE_FRAME),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
         return INSTRUMENT_CACHE_FRAME.copy()
 
 
@@ -592,6 +763,233 @@ def _range_rank(range_: str) -> int:
     return 0
 
 
+def maybe_confirm_extreme_with_tradingview(result: RatingResult, interval: str) -> dict:
+    started = time.perf_counter()
+    local_extreme = local_extreme_side(result)
+    if not local_extreme:
+        log_event(
+            "tradingview.confirmation.skip",
+            symbol=result.symbol,
+            interval=interval,
+            reason="local_not_aligned",
+        )
+        return {"checked": False, "reason": "Local gauges are not aligned on one side."}
+    if not tradingview_confirmation_enabled():
+        log_event(
+            "tradingview.confirmation.skip",
+            symbol=result.symbol,
+            interval=interval,
+            reason="disabled",
+        )
+        return {"checked": False, "reason": "TradingView confirmation is disabled."}
+    if TA_Handler is None or TVInterval is None:
+        log_event(
+            "tradingview.confirmation.skip",
+            symbol=result.symbol,
+            interval=interval,
+            reason="package_missing",
+        )
+        return {"checked": False, "reason": "Install tradingview-ta to enable confirmation."}
+    if interval not in TV_INTERVALS:
+        log_event(
+            "tradingview.confirmation.skip",
+            symbol=result.symbol,
+            interval=interval,
+            reason="unsupported_interval",
+        )
+        return {"checked": False, "reason": f"TradingView interval is not supported: {interval}"}
+
+    try:
+        tv = fetch_tradingview_recommendation(result.symbol, interval)
+    except Exception as exc:
+        log_event(
+            "tradingview.confirmation.error",
+            "error",
+            symbol=result.symbol,
+            interval=interval,
+            local_side=local_extreme,
+            error=str(exc),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
+        return {
+            "checked": True,
+            "applied": False,
+            "source": "TradingView",
+            "error": str(exc),
+            "local_side": local_extreme,
+        }
+    tv_side = tradingview_unanimous_extreme_side(tv)
+    if tv_side and tv_side == local_extreme:
+        apply_tradingview_extremes(result, tv, local_extreme)
+        tv["applied"] = True
+    else:
+        tv["applied"] = False
+    tv["checked"] = True
+    tv["local_side"] = local_extreme
+    log_event(
+        "tradingview.confirmation.success",
+        symbol=result.symbol,
+        interval=interval,
+        local_side=local_extreme,
+        summary=tv.get("summary"),
+        oscillators=tv.get("oscillators"),
+        moving_averages=tv.get("moving_averages"),
+        applied=tv["applied"],
+        cache=tv.get("cache"),
+        duration_ms=int((time.perf_counter() - started) * 1000),
+    )
+    return tv
+
+
+def local_extreme_side(result: RatingResult) -> str:
+    labels = [result.oscillator_label, result.overall_label, result.ma_label]
+    sides = {label_side(label) for label in labels}
+    return sides.pop() if len(sides) == 1 and sides <= {"sell", "buy"} else ""
+
+
+def label_side(label: str) -> str:
+    clean = label.lower()
+    if clean in {"sell", "strong sell"}:
+        return "sell"
+    if clean in {"buy", "strong buy"}:
+        return "buy"
+    return "neutral"
+
+
+def recommendation_side(recommendation: str) -> str:
+    clean = recommendation.upper()
+    if clean in {"SELL", "STRONG_SELL"}:
+        return "sell"
+    if clean in {"BUY", "STRONG_BUY"}:
+        return "buy"
+    return "neutral"
+
+
+def tradingview_unanimous_extreme_side(tv: dict) -> str:
+    recommendations = {
+        tv.get("summary"),
+        tv.get("oscillators"),
+        tv.get("moving_averages"),
+    }
+    if recommendations == {"STRONG_SELL"}:
+        return "sell"
+    if recommendations == {"STRONG_BUY"}:
+        return "buy"
+    return ""
+
+
+def fetch_tradingview_recommendation(symbol: str, interval: str) -> dict:
+    started = time.perf_counter()
+    exchange, tradingsymbol = normalize_kite_symbol(symbol)
+    cache_key = (f"{exchange}:{tradingsymbol}", interval)
+    now = time.time()
+    ttl = tradingview_cache_ttl_seconds()
+    with TV_CONFIRMATION_LOCK:
+        cached = TV_CONFIRMATION_CACHE.get(cache_key)
+        if cached and now - cached[0] < ttl:
+            payload = dict(cached[1])
+            payload["cache"] = "hit"
+            payload["age_seconds"] = int(now - cached[0])
+            log_event(
+                "tradingview.fetch.cache_hit",
+                symbol=cache_key[0],
+                interval=interval,
+                age_seconds=payload["age_seconds"],
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
+            return payload
+
+    log_event("tradingview.fetch.start", symbol=cache_key[0], interval=interval)
+    handler = TA_Handler(
+        symbol=tradingsymbol,
+        screener="india",
+        exchange=exchange,
+        interval=tradingview_interval(interval),
+        timeout=8,
+    )
+    analysis = handler.get_analysis()
+    summary = normalize_tv_recommendation(analysis.summary.get("RECOMMENDATION", ""))
+    oscillators = normalize_tv_recommendation(analysis.oscillators.get("RECOMMENDATION", ""))
+    moving_averages = normalize_tv_recommendation(analysis.moving_averages.get("RECOMMENDATION", ""))
+    payload = {
+        "source": "TradingView",
+        "symbol": f"{exchange}:{tradingsymbol}",
+        "interval": interval,
+        "summary": summary,
+        "oscillators": oscillators,
+        "moving_averages": moving_averages,
+        "counts": {
+            "summary": tv_counts(analysis.summary),
+            "oscillators": tv_counts(analysis.oscillators),
+            "moving_averages": tv_counts(analysis.moving_averages),
+        },
+        "cache": "miss",
+        "age_seconds": 0,
+        "ttl_seconds": ttl,
+    }
+    with TV_CONFIRMATION_LOCK:
+        TV_CONFIRMATION_CACHE[cache_key] = (now, payload)
+    log_event(
+        "tradingview.fetch.success",
+        symbol=cache_key[0],
+        interval=interval,
+        summary=summary,
+        oscillators=oscillators,
+        moving_averages=moving_averages,
+        duration_ms=int((time.perf_counter() - started) * 1000),
+    )
+    return dict(payload)
+
+
+def tradingview_interval(interval: str) -> str:
+    attr = {
+        "1m": "INTERVAL_1_MINUTE",
+        "5m": "INTERVAL_5_MINUTES",
+        "15m": "INTERVAL_15_MINUTES",
+        "30m": "INTERVAL_30_MINUTES",
+        "1h": "INTERVAL_1_HOUR",
+        "2h": "INTERVAL_2_HOURS",
+        "4h": "INTERVAL_4_HOURS",
+        "1d": "INTERVAL_1_DAY",
+    }[interval]
+    return getattr(TVInterval, attr)
+
+
+def normalize_tv_recommendation(value: object) -> str:
+    return str(value or "NEUTRAL").strip().upper().replace(" ", "_")
+
+
+def tv_counts(payload: dict) -> dict:
+    return {
+        "sell": int(payload.get("SELL", 0) or 0),
+        "neutral": int(payload.get("NEUTRAL", 0) or 0),
+        "buy": int(payload.get("BUY", 0) or 0),
+    }
+
+
+def apply_tradingview_extremes(result: RatingResult, tv: dict, side: str) -> None:
+    if side == "sell" and tv.get("summary") == "STRONG_SELL":
+        object.__setattr__(result, "overall_score", -1.0)
+        object.__setattr__(result, "overall_label", "Strong Sell")
+    elif side == "buy" and tv.get("summary") == "STRONG_BUY":
+        object.__setattr__(result, "overall_score", 1.0)
+        object.__setattr__(result, "overall_label", "Strong Buy")
+
+    if side == "sell" and tv.get("oscillators") == "STRONG_SELL":
+        object.__setattr__(result, "oscillator_score", -1.0)
+        object.__setattr__(result, "oscillator_label", "Strong Sell")
+    elif side == "buy" and tv.get("oscillators") == "STRONG_BUY":
+        object.__setattr__(result, "oscillator_score", 1.0)
+        object.__setattr__(result, "oscillator_label", "Strong Buy")
+
+    if side == "sell" and tv.get("moving_averages") == "STRONG_SELL":
+        object.__setattr__(result, "ma_score", -1.0)
+        object.__setattr__(result, "ma_label", "Strong Sell")
+    elif side == "buy" and tv.get("moving_averages") == "STRONG_BUY":
+        object.__setattr__(result, "ma_score", 1.0)
+        object.__setattr__(result, "ma_label", "Strong Buy")
+
+
 def result_to_dict(result: RatingResult) -> dict:
     return {
         "symbol": result.symbol,
@@ -615,6 +1013,16 @@ def load_csv(path: str | Path) -> pd.DataFrame:
 class RatingsHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        self._begin_request("GET", parsed)
+        try:
+            self._dispatch_get(parsed)
+        except Exception as exc:
+            log_event("request.unhandled_error", "error", method="GET", path=parsed.path, error=str(exc))
+            self._send_json({"ok": False, "error": "Internal server error"}, status=500)
+        finally:
+            self._finish_request("GET", parsed)
+
+    def _dispatch_get(self, parsed: urllib.parse.ParseResult) -> None:
         if parsed.path == "/login":
             self._send_html(LOGIN_HTML)
             return
@@ -645,25 +1053,67 @@ class RatingsHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/symbols":
             self._handle_symbols(parsed.query)
             return
+        if parsed.path == "/api/health":
+            self._handle_health()
+            return
         self.send_error(404, "Not found")
 
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
-        if parsed.path != "/login":
-            self.send_error(404, "Not found")
-            return
-        length = int(self.headers.get("Content-Length", "0") or 0)
-        body = self.rfile.read(length).decode("utf-8")
-        data = urllib.parse.parse_qs(body)
-        username = data.get("username", [""])[0]
-        password = data.get("password", [""])[0]
-        if auth_configured() and username == app_username() and hmac.compare_digest(password, app_password()):
-            self._set_session(username)
-        else:
-            self._send_html(LOGIN_HTML.replace("<!--ERROR-->", "<p class='error'>Invalid login or APP_PASSWORD is not set.</p>"), status=401)
+        self._begin_request("POST", parsed)
+        try:
+            if parsed.path != "/login":
+                self.send_error(404, "Not found")
+                return
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            body = self.rfile.read(length).decode("utf-8")
+            data = urllib.parse.parse_qs(body)
+            username = data.get("username", [""])[0]
+            password = data.get("password", [""])[0]
+            if auth_configured() and username == app_username() and hmac.compare_digest(password, app_password()):
+                log_event("auth.login.success", username=username)
+                self._set_session(username)
+            else:
+                log_event("auth.login.failure", "warning", username=username, auth_configured=auth_configured())
+                self._send_html(LOGIN_HTML.replace("<!--ERROR-->", "<p class='error'>Invalid login or APP_PASSWORD is not set.</p>"), status=401)
+        except Exception as exc:
+            log_event("request.unhandled_error", "error", method="POST", path=parsed.path, error=str(exc))
+            self._send_html(safe_error_html("Internal server error", "Request failed."), status=500)
+        finally:
+            self._finish_request("POST", parsed)
 
     def log_message(self, format: str, *args: object) -> None:
-        print(f"[{time.strftime('%H:%M:%S')}] {format % args}")
+        log_event("http.server", message=format % args)
+
+    def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:
+        self._response_status = code
+        log_event("response.error", "warning", status=code, message=message or "")
+        super().send_error(code, message, explain)
+
+    def _begin_request(self, method: str, parsed: urllib.parse.ParseResult) -> None:
+        self.request_id = secrets.token_hex(8)
+        self.request_started = time.perf_counter()
+        self._response_status = 0
+        REQUEST_CONTEXT.request_id = self.request_id
+        log_event(
+            "request.start",
+            method=method,
+            path=parsed.path,
+            query=sanitized_query(parsed.query),
+            client_ip=self.client_address[0] if self.client_address else "",
+            user_agent=self.headers.get("User-Agent", ""),
+        )
+
+    def _finish_request(self, method: str, parsed: urllib.parse.ParseResult) -> None:
+        duration_ms = int((time.perf_counter() - getattr(self, "request_started", time.perf_counter())) * 1000)
+        log_event(
+            "request.end",
+            method=method,
+            path=parsed.path,
+            status=getattr(self, "_response_status", 0),
+            duration_ms=duration_ms,
+        )
+        REQUEST_CONTEXT.request_id = ""
 
     def _is_authenticated(self) -> bool:
         jar = cookies.SimpleCookie(self.headers.get("Cookie", ""))
@@ -671,84 +1121,161 @@ class RatingsHandler(BaseHTTPRequestHandler):
         return verify_session_cookie(morsel.value if morsel else "")
 
     def _handle_ratings(self, query: str) -> None:
+        started = time.perf_counter()
         params = urllib.parse.parse_qs(query)
         symbol = params.get("symbol", [DEFAULT_SYMBOL])[0]
         interval = params.get("interval", ["1d"])[0]
         range_ = params.get("range", ["2y"])[0]
         csv_path = params.get("csv", [""])[0].strip()
+        log_event("ratings.request.start", symbol=symbol, interval=interval, range=range_, csv=bool(csv_path))
         try:
             if csv_path and not http_csv_enabled():
                 raise ValueError("HTTP CSV loading is disabled. Use CLI CSV mode or set APP_ALLOW_HTTP_CSV=true.")
             df = load_csv(csv_path) if csv_path else fetch_kite_ohlcv(symbol, interval, range_)
             result = technical_ratings(df, symbol=symbol)
-            self._send_json({"ok": True, "data": result_to_dict(result), "bars": len(df)})
+            confirmation = maybe_confirm_extreme_with_tradingview(result, validate_interval(interval))
+            log_event(
+                "ratings.request.success",
+                symbol=symbol,
+                interval=interval,
+                bars=len(df),
+                overall=result.overall_label,
+                oscillators=result.oscillator_label,
+                moving_averages=result.ma_label,
+                confirmation_checked=confirmation.get("checked", False),
+                confirmation_applied=confirmation.get("applied", False),
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
+            self._send_json(
+                {
+                    "ok": True,
+                    "data": result_to_dict(result),
+                    "bars": len(df),
+                    "confirmation": confirmation,
+                }
+            )
         except ValueError as exc:
+            log_event(
+                "ratings.request.error",
+                "warning",
+                symbol=symbol,
+                interval=interval,
+                error=str(exc),
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
             self._send_json({"ok": False, "error": str(exc)}, status=400)
         except Exception as exc:
+            log_event(
+                "ratings.request.error",
+                "error",
+                symbol=symbol,
+                interval=interval,
+                error=str(exc),
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
             self._send_json({"ok": False, "error": str(exc)}, status=500)
 
     def _handle_option_chain(self, query: str) -> None:
+        started = time.perf_counter()
         params = urllib.parse.parse_qs(query)
         symbol = params.get("symbol", [DEFAULT_SYMBOL])[0]
         expiry = params.get("expiry", [""])[0].strip()
         strikes = parse_int(params.get("strikes", ["8"])[0], default=8, minimum=1, maximum=25)
+        log_event("option_chain.request.start", symbol=symbol, expiry=expiry or "nearest", strikes=strikes)
         try:
             chain = fetch_option_chain(symbol, expiry=expiry, strikes_each_side=strikes)
+            log_event(
+                "option_chain.request.success",
+                symbol=symbol,
+                expiry=chain.get("expiry"),
+                rows=len(chain.get("rows", [])),
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
             self._send_json({"ok": True, "data": chain})
         except ValueError as exc:
+            log_event("option_chain.request.error", "warning", symbol=symbol, error=str(exc), duration_ms=int((time.perf_counter() - started) * 1000))
             self._send_json({"ok": False, "error": str(exc)}, status=400)
         except Exception as exc:
+            log_event("option_chain.request.error", "error", symbol=symbol, error=str(exc), duration_ms=int((time.perf_counter() - started) * 1000))
             self._send_json({"ok": False, "error": str(exc)}, status=500)
 
     def _handle_symbols(self, query: str) -> None:
+        started = time.perf_counter()
         params = urllib.parse.parse_qs(query)
         q = params.get("q", [""])[0]
         limit = parse_int(params.get("limit", ["25"])[0], default=25, minimum=1, maximum=50)
+        log_event("symbols.request.start", query=q, limit=limit)
         try:
-            self._send_json({"ok": True, "data": search_symbols(q, limit=limit)})
+            data = search_symbols(q, limit=limit)
+            log_event("symbols.request.success", query=q, results=len(data), duration_ms=int((time.perf_counter() - started) * 1000))
+            self._send_json({"ok": True, "data": data})
         except ValueError as exc:
+            log_event("symbols.request.error", "warning", query=q, error=str(exc), duration_ms=int((time.perf_counter() - started) * 1000))
             self._send_json({"ok": False, "error": str(exc)}, status=400)
         except Exception as exc:
+            log_event("symbols.request.error", "error", query=q, error=str(exc), duration_ms=int((time.perf_counter() - started) * 1000))
             self._send_json({"ok": False, "error": str(exc)}, status=500)
+
+    def _handle_health(self) -> None:
+        payload = {
+            "ok": True,
+            "data_dir": str(DATA_DIR),
+            "log_file": str(LOG_FILE_PATH) if LOG_FILE_PATH else "",
+            "tradingview_confirmation": tradingview_confirmation_enabled(),
+        }
+        log_event("health.success", **payload)
+        self._send_json(payload)
 
     def _handle_kite_callback(self, query: str) -> None:
         params = urllib.parse.parse_qs(query)
         request_token = params.get("request_token", [""])[0].strip()
         if not request_token:
+            log_event("kite.callback.error", "warning", error="missing_request_token")
             self._send_html(safe_error_html("Kite login failed", "No request_token received."), status=400)
             return
         try:
+            log_event("kite.callback.start")
             exchange_kite_request_token(request_token)
+            log_event("kite.callback.success")
             self._redirect("/")
         except Exception as exc:
+            log_event("kite.callback.error", "error", error=str(exc))
             self._send_html(safe_error_html("Kite token exchange failed", exc), status=502)
 
     def _send_html(self, body: str, status: int = 200) -> None:
         payload = body.encode("utf-8")
+        self._response_status = status
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Request-ID", current_request_id())
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
 
     def _send_json(self, data: dict, status: int = 200) -> None:
         payload = json.dumps(data, separators=(",", ":")).encode("utf-8")
+        self._response_status = status
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Request-ID", current_request_id())
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
 
     def _redirect(self, url: str) -> None:
+        self._response_status = 302
+        log_event("response.redirect", location=url)
         self.send_response(302)
         self.send_header("Location", url)
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Request-ID", current_request_id())
         self.end_headers()
 
     def _set_session(self, username: str) -> None:
         secure = "; Secure" if os.environ.get("APP_COOKIE_SECURE", "").lower() in {"1", "true", "yes"} else ""
+        self._response_status = 302
         self.send_response(302)
         self.send_header("Location", "/")
         self.send_header(
@@ -756,9 +1283,12 @@ class RatingsHandler(BaseHTTPRequestHandler):
             f"{APP_SESSION_COOKIE}={make_session_cookie(username)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=43200{secure}",
         )
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Request-ID", current_request_id())
         self.end_headers()
 
     def _logout(self) -> None:
+        log_event("auth.logout")
+        self._response_status = 302
         self.send_response(302)
         self.send_header("Location", "/login")
         self.send_header(
@@ -766,6 +1296,7 @@ class RatingsHandler(BaseHTTPRequestHandler):
             f"{APP_SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0",
         )
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Request-ID", current_request_id())
         self.end_headers()
 
 
@@ -1188,6 +1719,32 @@ INDEX_HTML = r"""<!doctype html>
       font-weight: 800;
       text-decoration: none;
     }
+    .confirmation {
+      min-height: 24px;
+      margin: 8px auto 0;
+      text-align: center;
+      color: #667085;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .confirmation span {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid #e5e7eb;
+      border-radius: 999px;
+      padding: 5px 10px;
+      background: #f8fafc;
+    }
+    .confirmation .applied {
+      color: #155eef;
+      background: #edf3ff;
+      border-color: #c7d7fe;
+    }
+    .confirmation .warn {
+      color: #b42318;
+      background: #fff0f2;
+      border-color: #ffc9d0;
+    }
     .tables {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -1368,6 +1925,7 @@ INDEX_HTML = r"""<!doctype html>
     </section>
 
     <p class="meta" id="meta">Waiting for data</p>
+    <p class="confirmation" id="confirmation"></p>
 
     <section class="tables">
       <div class="table-panel">
@@ -1602,7 +2160,30 @@ function setCounts(prefix, data) {
   document.getElementById(`${prefix}Buy`).textContent = data.buy;
 }
 
-function render(data, bars) {
+function formatTvRecommendation(value) {
+  return String(value || "NEUTRAL").replace("_", " ").toLowerCase().replace(/\b\w/g, char => char.toUpperCase());
+}
+
+function renderConfirmation(confirmation) {
+  const host = document.getElementById("confirmation");
+  if (!confirmation || !confirmation.checked) {
+    host.textContent = "";
+    return;
+  }
+  if (confirmation.error) {
+    host.innerHTML = `<span class="warn">TradingView confirmation failed: ${escapeHtml(confirmation.error)}</span>`;
+    return;
+  }
+  if (!confirmation.summary) {
+    host.innerHTML = `<span>${escapeHtml(confirmation.reason || "TradingView confirmation skipped")}</span>`;
+    return;
+  }
+  const cacheText = confirmation.cache === "hit" ? `cached ${confirmation.age_seconds || 0}s` : "fresh";
+  const cls = confirmation.applied ? "applied" : "";
+  host.innerHTML = `<span class="${cls}">TradingView ${formatTvRecommendation(confirmation.summary)} | Osc ${formatTvRecommendation(confirmation.oscillators)} | MA ${formatTvRecommendation(confirmation.moving_averages)} | ${cacheText}</span>`;
+}
+
+function render(data, bars, confirmation) {
   const maCounts = counts(data.moving_averages);
   const oscCounts = counts(data.oscillators);
   const summaryCounts = counts({ ...data.moving_averages, ...data.oscillators });
@@ -1621,6 +2202,7 @@ function render(data, bars) {
 
   document.getElementById("meta").textContent =
     `${data.symbol} | ${activeInterval} | Last price ${data.price.toFixed(2)} | ${bars ?? "--"} bars`;
+  renderConfirmation(confirmation);
   renderRows("oscRows", data.oscillators, data.indicator_values);
   renderRows("maRows", data.moving_averages, data.indicator_values);
 }
@@ -1638,7 +2220,7 @@ async function load() {
     const response = await fetch(`/api/ratings?${qs.toString()}`);
     const payload = await response.json();
     if (!payload.ok) throw new Error(payload.error || "Unable to calculate ratings");
-    render(payload.data, payload.bars);
+    render(payload.data, payload.bars, payload.confirmation);
   } finally {
     refreshInFlight = false;
   }
@@ -1740,6 +2322,7 @@ tfButtons.forEach(button => {
 
 function showError(error) {
   const meta = document.getElementById("meta");
+  document.getElementById("confirmation").textContent = "";
   if (String(error.message).includes("Kite not connected")) {
     meta.innerHTML = `${escapeHtml(error.message)} <a href="/kite/login">Connect Kite</a>`;
   } else {
@@ -1806,15 +2389,36 @@ load().catch(showError);
 def run_server(host: str, port: int) -> None:
     validate_runtime_config(host)
     server = ThreadingHTTPServer((host, port), RatingsHandler)
+    log_event(
+        "server.start",
+        host=host,
+        port=port,
+        data_dir=str(DATA_DIR),
+        log_to_file=os.environ.get("STOCKRADAR_LOG_TO_FILE", "true"),
+        log_file=str(LOG_FILE_PATH) if LOG_FILE_PATH else "",
+        tradingview_confirmation=tradingview_confirmation_enabled(),
+    )
     print(f"Technical Ratings app running at http://{host}:{port}")
+    if LOG_FILE_PATH:
+        print(f"StockRadar logs: {LOG_FILE_PATH}")
     server.serve_forever()
 
 
 def run_cli(symbol: str, csv_path: str | None, interval: str, range_: str) -> None:
+    started = time.perf_counter()
+    log_event("cli.ratings.start", symbol=symbol, interval=interval, range=range_, csv=bool(csv_path))
     interval = validate_interval(interval)
     range_ = validate_range(range_)
     df = load_csv(csv_path) if csv_path else fetch_kite_ohlcv(symbol, interval, range_)
     result = technical_ratings(df, symbol=validate_symbol(symbol))
+    log_event(
+        "cli.ratings.success",
+        symbol=result.symbol,
+        interval=interval,
+        bars=len(df),
+        overall=result.overall_label,
+        duration_ms=int((time.perf_counter() - started) * 1000),
+    )
     print(json.dumps(result_to_dict(result), indent=2))
 
 
