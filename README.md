@@ -10,15 +10,37 @@ Install dependencies:
 python -m pip install -r requirements.txt
 ```
 
-Set app and Kite credentials first:
+Create your local environment file:
+
+```cmd
+copy .env.example .env
+```
+
+Edit `.env` and set your app login and Kite credentials:
+
+```env
+APP_USERNAME=admin
+APP_PASSWORD=use-a-strong-password
+APP_SESSION_SECRET=replace-with-a-generated-random-secret
+KITE_API_KEY=your_kite_api_key
+KITE_API_SECRET=your_kite_api_secret
+APP_COOKIE_SECURE=false
+APP_ALLOW_HTTP_CSV=false
+```
+
+Generate `APP_SESSION_SECRET` from **cmd.exe**:
+
+```cmd
+powershell -NoProfile -Command "[Convert]::ToBase64String((1..48 | ForEach-Object { Get-Random -Maximum 256 }))"
+```
+
+Generate it from **PowerShell**:
 
 ```powershell
-$env:APP_USERNAME="admin"
-$env:APP_PASSWORD="use-a-strong-password"
-$env:APP_SESSION_SECRET="use-a-long-random-secret"
-$env:KITE_API_KEY="your_api_key"
-$env:KITE_API_SECRET="your_api_secret"
+[Convert]::ToBase64String((1..48 | ForEach-Object { Get-Random -Maximum 256 }))
 ```
+
+Paste the generated value into `.env` as `APP_SESSION_SECRET`.
 
 ```powershell
 python app.py --host 127.0.0.1 --port 8765
@@ -41,8 +63,8 @@ It also saves the token locally at `data/kite_access_token.json` for the current
 
 If you already have an access token, set it directly:
 
-```powershell
-$env:KITE_ACCESS_TOKEN="your_daily_access_token"
+```env
+KITE_ACCESS_TOKEN=your_daily_access_token
 ```
 
 ## CLI

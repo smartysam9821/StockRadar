@@ -1,5 +1,6 @@
 data/kite_access_token.json
 data/kite_instruments.csv
+.env
 server.out.log
 server.err.log
 __pycache__/
