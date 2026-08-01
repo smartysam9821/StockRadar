@@ -4,9 +4,13 @@ import argparse
 import base64
 import difflib
 import hmac
-import os
+import html
 import json
+import os
+import re
 import secrets
+import tempfile
+import threading
 import time
 import urllib.parse
 from http import cookies
@@ -21,10 +25,18 @@ from technical_ratings import RatingResult, technical_ratings
 
 
 DEFAULT_SYMBOL = "ASIANPAINT.NS"
-KITE_INSTRUMENT_CACHE = Path("data/kite_instruments.csv")
-KITE_TOKEN_FILE = Path("data/kite_access_token.json")
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = Path(os.environ.get("STOCKRADAR_DATA_DIR", BASE_DIR / "data")).resolve()
+KITE_INSTRUMENT_CACHE = DATA_DIR / "kite_instruments.csv"
+KITE_TOKEN_FILE = DATA_DIR / "kite_access_token.json"
 KITE_ACCESS_TOKEN_MEMORY = ""
 APP_SESSION_COOKIE = "stock_app_session"
+ALLOWED_INTERVALS = {"1m", "5m", "15m", "30m", "1h", "2h", "4h", "1d", "1wk", "1mo"}
+ALLOWED_RANGES = {"1d", "5d", "7d", "30d", "60d", "90d", "6mo", "1y", "2y", "5y", "10y", "max"}
+SYMBOL_RE = re.compile(r"^(?:[A-Z]{2,5}:)?[A-Z0-9&.\-]{1,32}(?:\.NS)?$")
+TOKEN_LOCK = threading.RLock()
+INSTRUMENT_LOCK = threading.RLock()
+INSTRUMENT_CACHE_FRAME: pd.DataFrame | None = None
 
 
 def disable_kite_proxy_env() -> None:
@@ -48,6 +60,54 @@ def app_session_secret() -> str:
 
 def auth_configured() -> bool:
     return bool(app_password())
+
+
+def public_host(host: str) -> bool:
+    return host not in {"127.0.0.1", "localhost", "::1"}
+
+
+def validate_runtime_config(host: str) -> None:
+    if public_host(host) and not auth_configured():
+        raise RuntimeError("APP_PASSWORD must be set before binding the app to a public interface.")
+    if public_host(host) and app_session_secret() == "dev-only-change-me":
+        raise RuntimeError("APP_SESSION_SECRET must be set before binding the app to a public interface.")
+
+
+def validate_interval(interval: str) -> str:
+    clean = interval.strip()
+    if clean not in ALLOWED_INTERVALS:
+        raise ValueError(f"Unsupported interval: {interval}")
+    return clean
+
+
+def validate_range(range_: str) -> str:
+    clean = range_.strip()
+    if clean not in ALLOWED_RANGES:
+        raise ValueError(f"Unsupported range: {range_}")
+    return clean
+
+
+def validate_symbol(symbol: str) -> str:
+    clean = symbol.strip().upper() or DEFAULT_SYMBOL
+    if not SYMBOL_RE.match(clean):
+        raise ValueError(f"Invalid symbol: {symbol}")
+    return clean
+
+
+def parse_int(value: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def http_csv_enabled() -> bool:
+    return os.environ.get("APP_ALLOW_HTTP_CSV", "").lower() in {"1", "true", "yes"}
+
+
+def safe_error_html(title: str, message: object) -> str:
+    return f"<h1>{html.escape(title)}</h1><p>{html.escape(str(message))}</p>"
 
 
 def make_session_cookie(username: str) -> str:
@@ -77,6 +137,9 @@ def verify_session_cookie(value: str) -> bool:
 
 
 def fetch_kite_ohlcv(symbol: str, interval: str = "1d", range_: str = "2y") -> pd.DataFrame:
+    symbol = validate_symbol(symbol)
+    interval = validate_interval(interval)
+    range_ = validate_range(range_)
     api_key = os.environ.get("KITE_API_KEY", "").strip()
     access_token = current_kite_access_token()
     if not api_key:
@@ -114,12 +177,13 @@ def current_kite_access_token() -> str:
 
 
 def load_saved_kite_access_token() -> str:
-    if not KITE_TOKEN_FILE.exists():
-        return ""
-    try:
-        payload = json.loads(KITE_TOKEN_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return ""
+    with TOKEN_LOCK:
+        if not KITE_TOKEN_FILE.exists():
+            return ""
+        try:
+            payload = json.loads(KITE_TOKEN_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return ""
     token = str(payload.get("access_token", "")).strip()
     saved_date = str(payload.get("date", "")).strip()
     if saved_date and saved_date != datetime.now().date().isoformat():
@@ -128,13 +192,19 @@ def load_saved_kite_access_token() -> str:
 
 
 def save_kite_access_token(access_token: str) -> None:
-    KITE_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "access_token": access_token,
         "date": datetime.now().date().isoformat(),
         "saved_at": datetime.now().isoformat(timespec="seconds"),
     }
-    KITE_TOKEN_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    with TOKEN_LOCK:
+        KITE_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", delete=False, dir=KITE_TOKEN_FILE.parent, encoding="utf-8", suffix=".tmp"
+        ) as handle:
+            json.dump(payload, handle, indent=2)
+            temp_name = handle.name
+        Path(temp_name).replace(KITE_TOKEN_FILE)
 
 
 def kite_login_url() -> str:
@@ -171,7 +241,7 @@ def kite_client(access_token: str | None = None) -> KiteConnect:
 
 
 def normalize_kite_symbol(symbol: str) -> tuple[str, str]:
-    clean = symbol.strip().upper()
+    clean = validate_symbol(symbol)
     if ":" in clean:
         exchange, tradingsymbol = clean.split(":", 1)
         return exchange, tradingsymbol
@@ -286,6 +356,7 @@ def get_kite_instrument_token(exchange: str, tradingsymbol: str) -> int:
 
 
 def search_symbols(query: str, limit: int = 25) -> list[dict]:
+    limit = max(1, min(limit, 50))
     instruments = load_kite_instruments()
     stocks = instruments[
         (instruments["exchange"].astype(str).str.upper() == "NSE")
@@ -334,6 +405,8 @@ def search_symbols(query: str, limit: int = 25) -> list[dict]:
 
 
 def fetch_option_chain(symbol: str, expiry: str = "", strikes_each_side: int = 8) -> dict:
+    symbol = validate_symbol(symbol)
+    strikes_each_side = max(1, min(strikes_each_side, 25))
     access_token = current_kite_access_token()
     if not access_token:
         raise ValueError("Kite session not connected. Open /kite/login and complete Kite login once.")
@@ -417,11 +490,24 @@ def best_depth_price(quote: dict, side: str) -> float | None:
 
 
 def load_kite_instruments() -> pd.DataFrame:
-    if not KITE_INSTRUMENT_CACHE.exists() or cache_age_seconds(KITE_INSTRUMENT_CACHE) > 12 * 60 * 60:
-        KITE_INSTRUMENT_CACHE.parent.mkdir(parents=True, exist_ok=True)
-        instruments = pd.DataFrame(kite_client(access_token="").instruments())
-        instruments.to_csv(KITE_INSTRUMENT_CACHE, index=False)
-    return pd.read_csv(KITE_INSTRUMENT_CACHE)
+    global INSTRUMENT_CACHE_FRAME
+    with INSTRUMENT_LOCK:
+        fresh_file = KITE_INSTRUMENT_CACHE.exists() and cache_age_seconds(KITE_INSTRUMENT_CACHE) <= 12 * 60 * 60
+        if INSTRUMENT_CACHE_FRAME is not None and fresh_file:
+            return INSTRUMENT_CACHE_FRAME.copy()
+        if not fresh_file:
+            KITE_INSTRUMENT_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            instruments = pd.DataFrame(kite_client(access_token="").instruments())
+            with tempfile.NamedTemporaryFile(
+                "w", delete=False, dir=KITE_INSTRUMENT_CACHE.parent, encoding="utf-8", suffix=".tmp"
+            ) as handle:
+                instruments.to_csv(handle, index=False)
+                temp_name = handle.name
+            Path(temp_name).replace(KITE_INSTRUMENT_CACHE)
+            INSTRUMENT_CACHE_FRAME = instruments
+            return instruments.copy()
+        INSTRUMENT_CACHE_FRAME = pd.read_csv(KITE_INSTRUMENT_CACHE)
+        return INSTRUMENT_CACHE_FRAME.copy()
 
 
 def cache_age_seconds(path: Path) -> float:
@@ -469,16 +555,18 @@ def history_range_for_indicators(interval: str, requested_range: str) -> str:
 def _range_rank(range_: str) -> int:
     if range_ == "max":
         return 10_000_000
-    unit = range_[-1]
-    try:
-        value = int(range_[:-1])
-    except ValueError:
+    match = re.fullmatch(r"(\d+)(d|w|mo|y|m)", range_)
+    if not match:
         return 0
+    value = int(match.group(1))
+    unit = match.group(2)
     if unit == "d":
         return value
     if unit == "w":
         return value * 7
     if unit == "m":
+        return value / (24 * 60)
+    if unit == "mo":
         return value * 31
     if unit == "y":
         return value * 366
@@ -565,34 +653,42 @@ class RatingsHandler(BaseHTTPRequestHandler):
 
     def _handle_ratings(self, query: str) -> None:
         params = urllib.parse.parse_qs(query)
-        symbol = params.get("symbol", [DEFAULT_SYMBOL])[0].strip() or DEFAULT_SYMBOL
+        symbol = params.get("symbol", [DEFAULT_SYMBOL])[0]
         interval = params.get("interval", ["1d"])[0]
         range_ = params.get("range", ["2y"])[0]
         csv_path = params.get("csv", [""])[0].strip()
         try:
+            if csv_path and not http_csv_enabled():
+                raise ValueError("HTTP CSV loading is disabled. Use CLI CSV mode or set APP_ALLOW_HTTP_CSV=true.")
             df = load_csv(csv_path) if csv_path else fetch_kite_ohlcv(symbol, interval, range_)
             result = technical_ratings(df, symbol=symbol)
             self._send_json({"ok": True, "data": result_to_dict(result), "bars": len(df)})
+        except ValueError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, status=400)
         except Exception as exc:
             self._send_json({"ok": False, "error": str(exc)}, status=500)
 
     def _handle_option_chain(self, query: str) -> None:
         params = urllib.parse.parse_qs(query)
-        symbol = params.get("symbol", [DEFAULT_SYMBOL])[0].strip() or DEFAULT_SYMBOL
+        symbol = params.get("symbol", [DEFAULT_SYMBOL])[0]
         expiry = params.get("expiry", [""])[0].strip()
-        strikes = int(params.get("strikes", ["8"])[0])
+        strikes = parse_int(params.get("strikes", ["8"])[0], default=8, minimum=1, maximum=25)
         try:
             chain = fetch_option_chain(symbol, expiry=expiry, strikes_each_side=strikes)
             self._send_json({"ok": True, "data": chain})
+        except ValueError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, status=400)
         except Exception as exc:
             self._send_json({"ok": False, "error": str(exc)}, status=500)
 
     def _handle_symbols(self, query: str) -> None:
         params = urllib.parse.parse_qs(query)
         q = params.get("q", [""])[0]
-        limit = int(params.get("limit", ["25"])[0])
+        limit = parse_int(params.get("limit", ["25"])[0], default=25, minimum=1, maximum=50)
         try:
             self._send_json({"ok": True, "data": search_symbols(q, limit=limit)})
+        except ValueError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, status=400)
         except Exception as exc:
             self._send_json({"ok": False, "error": str(exc)}, status=500)
 
@@ -600,13 +696,13 @@ class RatingsHandler(BaseHTTPRequestHandler):
         params = urllib.parse.parse_qs(query)
         request_token = params.get("request_token", [""])[0].strip()
         if not request_token:
-            self._send_html("<h1>Kite login failed</h1><p>No request_token received.</p>")
+            self._send_html(safe_error_html("Kite login failed", "No request_token received."), status=400)
             return
         try:
             exchange_kite_request_token(request_token)
             self._redirect("/")
         except Exception as exc:
-            self._send_html(f"<h1>Kite token exchange failed</h1><p>{exc}</p>")
+            self._send_html(safe_error_html("Kite token exchange failed", exc), status=502)
 
     def _send_html(self, body: str, status: int = 200) -> None:
         payload = body.encode("utf-8")
@@ -1365,10 +1461,20 @@ function formatValue(value) {
   return Number(value).toFixed(2);
 }
 
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, char => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+  }[char]));
+}
+
 function renderRows(targetId, signals, values) {
   document.getElementById(targetId).innerHTML = Object.entries(signals).map(([name, value]) => {
     const displayValue = values[valueKeys[name] || name];
-    return `<tr><td>${name}</td><td>${formatValue(displayValue)}</td><td><span class="signal ${classForSignal(value)}">${labelForSignal(value)}</span></td></tr>`;
+    return `<tr><td>${escapeHtml(name)}</td><td>${formatValue(displayValue)}</td><td><span class="signal ${classForSignal(value)}">${labelForSignal(value)}</span></td></tr>`;
   }).join("");
 }
 
@@ -1539,7 +1645,7 @@ function renderOptionChain(data) {
   const previousExpiry = expirySelect.value;
   expirySelect.innerHTML = data.expiries.map(expiry => {
     const selected = expiry === data.expiry || expiry === previousExpiry ? "selected" : "";
-    return `<option value="${expiry}" ${selected}>${expiry}</option>`;
+    return `<option value="${escapeHtml(expiry)}" ${selected}>${escapeHtml(expiry)}</option>`;
   }).join("");
   document.getElementById("chainRows").innerHTML = data.rows.map(row => {
     const ce = row.CE || {};
@@ -1599,7 +1705,7 @@ async function loadSymbolSuggestions() {
   if (!payload.ok) return;
   symbolSuggestions.innerHTML = payload.data.map(item => {
     const tag = item.optionable ? " | F&O" : "";
-    return `<option value="${item.symbol}" label="${item.tradingsymbol}${tag} - ${item.name}"></option>`;
+    return `<option value="${escapeHtml(item.symbol)}" label="${escapeHtml(`${item.tradingsymbol}${tag} - ${item.name}`)}"></option>`;
   }).join("");
 }
 
@@ -1616,7 +1722,7 @@ tfButtons.forEach(button => {
 function showError(error) {
   const meta = document.getElementById("meta");
   if (String(error.message).includes("Kite not connected")) {
-    meta.innerHTML = `${error.message} <a href="/kite/login">Connect Kite</a>`;
+    meta.innerHTML = `${escapeHtml(error.message)} <a href="/kite/login">Connect Kite</a>`;
   } else {
     meta.textContent = error.message;
   }
@@ -1626,7 +1732,7 @@ function showError(error) {
 function showChainError(error) {
   const chainMeta = document.getElementById("chainMeta");
   if (String(error.message).includes("Kite session")) {
-    chainMeta.innerHTML = `${error.message} <a href="/kite/login">Connect Kite</a>`;
+    chainMeta.innerHTML = `${escapeHtml(error.message)} <a href="/kite/login">Connect Kite</a>`;
   } else {
     chainMeta.textContent = error.message;
   }
@@ -1679,14 +1785,17 @@ load().catch(showError);
 
 
 def run_server(host: str, port: int) -> None:
+    validate_runtime_config(host)
     server = ThreadingHTTPServer((host, port), RatingsHandler)
     print(f"Technical Ratings app running at http://{host}:{port}")
     server.serve_forever()
 
 
 def run_cli(symbol: str, csv_path: str | None, interval: str, range_: str) -> None:
+    interval = validate_interval(interval)
+    range_ = validate_range(range_)
     df = load_csv(csv_path) if csv_path else fetch_kite_ohlcv(symbol, interval, range_)
-    result = technical_ratings(df, symbol=symbol)
+    result = technical_ratings(df, symbol=validate_symbol(symbol))
     print(json.dumps(result_to_dict(result), indent=2))
 
 

@@ -1,12 +1,21 @@
-# TradingView-style Technical Ratings Gauge
+# StockRadar
 
-This project calculates a TradingView-style Technical Ratings score and renders a local gauge for symbols such as `ASIANPAINT.NS`.
+StockRadar calculates TradingView-style Technical Ratings, renders a modern three-gauge dashboard, and fetches NSE cash/option data through Kite Connect.
 
 ## Run
 
-Set Kite credentials first:
+Install dependencies:
 
 ```powershell
+python -m pip install -r requirements.txt
+```
+
+Set app and Kite credentials first:
+
+```powershell
+$env:APP_USERNAME="admin"
+$env:APP_PASSWORD="use-a-strong-password"
+$env:APP_SESSION_SECRET="use-a-long-random-secret"
 $env:KITE_API_KEY="your_api_key"
 $env:KITE_API_SECRET="your_api_secret"
 ```
@@ -61,6 +70,32 @@ python app.py --cli --csv path\to\ohlcv.csv
 ```
 
 The CSV must contain `Open`, `High`, `Low`, `Close`, and `Volume` columns.
+
+## Public Deployment
+
+For internet exposure, bind to a public interface only after setting `APP_PASSWORD` and `APP_SESSION_SECRET`:
+
+```powershell
+python app.py --host 0.0.0.0 --port 80
+```
+
+Run behind HTTPS, such as IIS/Nginx/Caddy reverse proxy or a cloud load balancer. If HTTPS terminates before Python, set:
+
+```powershell
+$env:APP_COOKIE_SECURE="true"
+```
+
+Runtime files are stored in `data/` by default. To keep tokens/cache outside the repo:
+
+```powershell
+$env:STOCKRADAR_DATA_DIR="D:\StockRadarData"
+```
+
+HTTP CSV loading is disabled by default for safety. Keep CSV analysis on the CLI, or explicitly enable it only on trusted private deployments:
+
+```powershell
+$env:APP_ALLOW_HTTP_CSV="true"
+```
 
 ## Accuracy Notes
 
