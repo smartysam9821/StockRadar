@@ -5,6 +5,7 @@ import base64
 import difflib
 import hmac
 import html
+import io
 import json
 import logging
 import os
@@ -14,7 +15,11 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
+import zipfile
+import http.cookiejar
 from http import cookies
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -71,6 +76,59 @@ INDEX_OPTION_UNDERLYING_ALIASES = {
     "NIFTY FIN SERVICE": "FINNIFTY",
     "NIFTY MID SELECT": "MIDCPNIFTY",
 }
+DEFAULT_OI_BASELINE_UNDERLYINGS = {
+    "NIFTY",
+    "ADANIENT",
+    "ADANIPORTS",
+    "APOLLOHOSP",
+    "ASIANPAINT",
+    "AXISBANK",
+    "BAJAJ-AUTO",
+    "BAJFINANCE",
+    "BAJAJFINSV",
+    "BEL",
+    "BHARTIARTL",
+    "CIPLA",
+    "COALINDIA",
+    "DRREDDY",
+    "EICHERMOT",
+    "ETERNAL",
+    "GRASIM",
+    "HCLTECH",
+    "HDFCBANK",
+    "HDFCLIFE",
+    "HEROMOTOCO",
+    "HINDALCO",
+    "HINDUNILVR",
+    "ICICIBANK",
+    "INDUSINDBK",
+    "INFY",
+    "ITC",
+    "JIOFIN",
+    "JSWSTEEL",
+    "KOTAKBANK",
+    "LT",
+    "M&M",
+    "MARUTI",
+    "NESTLEIND",
+    "NTPC",
+    "ONGC",
+    "POWERGRID",
+    "RELIANCE",
+    "SBILIFE",
+    "SBIN",
+    "SHRIRAMFIN",
+    "SUNPHARMA",
+    "TATACONSUM",
+    "TATAMOTORS",
+    "TATASTEEL",
+    "TCS",
+    "TECHM",
+    "TITAN",
+    "TRENT",
+    "ULTRACEMCO",
+    "WIPRO",
+}
 TRADINGVIEW_SYMBOL_ALIASES = {
     "NIFTY 50": "NIFTY",
     "NIFTY BANK": "BANKNIFTY",
@@ -82,6 +140,7 @@ INSTRUMENT_CACHE_FRAME: pd.DataFrame | None = None
 REQUEST_CONTEXT = threading.local()
 DB_LOCK = threading.RLock()
 DB_READY = False
+OI_BASELINE_THREAD_STARTED = False
 TV_CONFIRMATION_LOCK = threading.RLock()
 TV_CONFIRMATION_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
 TV_INTERVALS = {
@@ -222,6 +281,42 @@ def tradingview_cache_ttl_seconds() -> int:
         minimum=60,
         maximum=3600,
     )
+
+
+def oi_baseline_enabled() -> bool:
+    return os.environ.get("OI_BASELINE_ENABLED", "true").lower() in {"1", "true", "yes"}
+
+
+def oi_baseline_capture_time() -> tuple[int, int]:
+    value = os.environ.get("OI_BASELINE_CAPTURE_TIME", "15:35").strip()
+    match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", value)
+    if not match:
+        return 15, 35
+    return int(match.group(1)), int(match.group(2))
+
+
+def oi_baseline_poll_seconds() -> int:
+    return parse_int(os.environ.get("OI_BASELINE_POLL_SECONDS", "60"), 60, 30, 3600)
+
+
+def nse_bhavcopy_lookback_days() -> int:
+    return parse_int(os.environ.get("NSE_BHAVCOPY_LOOKBACK_DAYS", "10"), 10, 1, 30)
+
+
+def nse_bhavcopy_base_url() -> str:
+    return os.environ.get("NSE_BHAVCOPY_BASE_URL", "https://nsearchives.nseindia.com/content/fo").rstrip("/")
+
+
+def oi_baseline_underlyings() -> set[str]:
+    configured = os.environ.get("OI_BASELINE_UNDERLYINGS", "").strip()
+    if not configured:
+        return set(DEFAULT_OI_BASELINE_UNDERLYINGS)
+    values = {
+        option_underlying_symbol(item.strip().upper().removesuffix(".NS"))
+        for item in configured.split(",")
+        if item.strip()
+    }
+    return values or set(DEFAULT_OI_BASELINE_UNDERLYINGS)
 
 
 def safe_error_html(title: str, message: object) -> str:
@@ -639,14 +734,16 @@ def fetch_option_chain(symbol: str, expiry: str = "", strikes_each_side: int = 8
     selected_strikes = strikes[start:end]
     chain = chain[chain["strike"].isin(selected_strikes)]
 
-    keys = [f"NFO:{row.tradingsymbol}" for row in chain.itertuples()]
+    contract_symbols = [str(row.tradingsymbol) for row in chain.itertuples()]
+    previous_oi = load_previous_oi_baselines(contract_symbols, datetime.now().date())
+    keys = [f"NFO:{symbol}" for symbol in contract_symbols]
     quotes = kite_client().quote(*keys) if keys else {}
     by_strike: dict[float, dict] = {}
     for row in chain.itertuples():
         strike_row = by_strike.setdefault(float(row.strike), {"strike": float(row.strike)})
         side = str(row.instrument_type).upper()
         quote = quotes.get(f"NFO:{row.tradingsymbol}", {})
-        strike_row[side] = option_quote_payload(row, quote)
+        strike_row[side] = option_quote_payload(row, quote, previous_oi.get(str(row.tradingsymbol)))
 
     rows = [by_strike[strike] for strike in sorted(by_strike)]
     payload = {
@@ -674,15 +771,19 @@ def kite_spot_price(underlying: str) -> float:
     return float(ltp[quote_key]["last_price"])
 
 
-def option_quote_payload(row, quote: dict) -> dict:
+def option_quote_payload(row, quote: dict, previous_oi: int | None = None) -> dict:
+    current_oi = quote.get("oi")
+    if current_oi is not None and previous_oi is not None:
+        oi_change = int(current_oi) - int(previous_oi)
+    else:
+        oi_change = quote.get("oi_change") or quote.get("change_in_oi") or quote.get("oi_day_change")
     return {
         "tradingsymbol": row.tradingsymbol,
         "ltp": quote.get("last_price"),
         "change": quote.get("net_change"),
-        "oi": quote.get("oi"),
-        "oi_change": quote.get("oi_change")
-        or quote.get("change_in_oi")
-        or quote.get("oi_day_change"),
+        "oi": current_oi,
+        "previous_oi": previous_oi,
+        "oi_change": oi_change,
         "volume": quote.get("volume"),
         "bid": best_depth_price(quote, "buy"),
         "ask": best_depth_price(quote, "sell"),
@@ -864,6 +965,42 @@ def ensure_events_table() -> bool:
                         ON events (signal, created_at DESC)
                         """
                     )
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS option_oi_daily (
+                            id BIGSERIAL PRIMARY KEY,
+                            trade_date DATE NOT NULL,
+                            captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                            underlying TEXT NOT NULL,
+                            tradingsymbol TEXT NOT NULL,
+                            expiry DATE,
+                            strike DOUBLE PRECISION,
+                            option_type TEXT NOT NULL CHECK (option_type IN ('CE', 'PE')),
+                            oi BIGINT NOT NULL,
+                            last_price DOUBLE PRECISION,
+                            source TEXT NOT NULL DEFAULT 'nse.bhavcopy',
+                            UNIQUE (trade_date, tradingsymbol)
+                        )
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_option_oi_daily_symbol_date
+                        ON option_oi_daily (tradingsymbol, trade_date DESC)
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_option_oi_daily_underlying_expiry
+                        ON option_oi_daily (underlying, expiry, trade_date DESC)
+                        """
+                    )
+                    cur.execute(
+                        """
+                        ALTER TABLE option_oi_daily
+                        ALTER COLUMN source SET DEFAULT 'nse.bhavcopy'
+                        """
+                    )
             DB_READY = True
             log_event("db.events_table.ready", duration_ms=int((time.perf_counter() - started) * 1000))
             return True
@@ -972,6 +1109,308 @@ def store_confirmed_event(result: RatingResult, interval: str, bars: int, tv: di
             duration_ms=int((time.perf_counter() - started) * 1000),
         )
         return False
+
+
+def option_oi_baseline_exists(trade_date: object) -> bool:
+    if not ensure_events_table():
+        return False
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM option_oi_daily WHERE trade_date = %s LIMIT 1", (trade_date,))
+            return cur.fetchone() is not None
+
+
+def load_previous_oi_baselines(tradingsymbols: list[str], trade_date: object) -> dict[str, int]:
+    if not tradingsymbols or not database_enabled() or psycopg is None:
+        return {}
+    if not ensure_events_table():
+        return {}
+    placeholders = ",".join(["%s"] * len(tradingsymbols))
+    sql = f"""
+        SELECT DISTINCT ON (tradingsymbol) tradingsymbol, oi
+        FROM option_oi_daily
+        WHERE tradingsymbol IN ({placeholders}) AND trade_date < %s
+        ORDER BY tradingsymbol, trade_date DESC
+    """
+    try:
+        with db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, [*tradingsymbols, trade_date])
+                return {str(symbol): int(oi) for symbol, oi in cur.fetchall()}
+    except Exception as exc:
+        log_event("db.option_oi_baseline.load_error", "error", error=str(exc), contracts=len(tradingsymbols))
+        return {}
+
+
+def nse_bhavcopy_filename(trade_date: object) -> str:
+    date_value = pd.to_datetime(trade_date).strftime("%Y%m%d")
+    return f"BhavCopy_NSE_FO_0_0_0_{date_value}_F_0000.csv.zip"
+
+
+def nse_bhavcopy_url(trade_date: object) -> str:
+    return f"{nse_bhavcopy_base_url()}/{nse_bhavcopy_filename(trade_date)}"
+
+
+def nse_request_headers() -> dict[str, str]:
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/csv,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+        "Referer": "https://www.nseindia.com/all-reports-derivatives",
+    }
+
+
+def download_nse_fo_bhavcopy(trade_date: object) -> pd.DataFrame:
+    started = time.perf_counter()
+    cache_dir = DATA_DIR / "nse_fo_bhavcopy"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / nse_bhavcopy_filename(trade_date)
+    if cache_path.exists():
+        data = cache_path.read_bytes()
+        log_event("nse.bhavcopy.cache.hit", trade_date=str(trade_date), cache_path=str(cache_path), bytes=len(data))
+    else:
+        url = nse_bhavcopy_url(trade_date)
+        headers = nse_request_headers()
+        cookie_jar = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
+        try:
+            warmup = urllib.request.Request("https://www.nseindia.com/all-reports-derivatives", headers=headers)
+            opener.open(warmup, timeout=10).read(1024)
+        except Exception:
+            pass
+        request = urllib.request.Request(url, headers=headers)
+        log_event("nse.bhavcopy.download.start", trade_date=str(trade_date), url=url)
+        with opener.open(request, timeout=30) as response:
+            data = response.read()
+        cache_path.write_bytes(data)
+        log_event(
+            "nse.bhavcopy.download.success",
+            trade_date=str(trade_date),
+            cache_path=str(cache_path),
+            bytes=len(data),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        csv_name = next((name for name in archive.namelist() if name.lower().endswith(".csv")), archive.namelist()[0])
+        with archive.open(csv_name) as handle:
+            return pd.read_csv(handle)
+
+
+def normalized_column_name(name: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(name).lower())
+
+
+def find_bhavcopy_column(frame: pd.DataFrame, candidates: list[str]) -> str:
+    normalized = {normalized_column_name(column): column for column in frame.columns}
+    for candidate in candidates:
+        column = normalized.get(normalized_column_name(candidate))
+        if column is not None:
+            return column
+    raise ValueError(f"NSE bhavcopy column not found. Tried: {', '.join(candidates)}")
+
+
+def kite_option_contract_map() -> dict[tuple[str, object, float, str], object]:
+    instruments = load_kite_instruments()
+    allowed_underlyings = oi_baseline_underlyings()
+    options = instruments[
+        (instruments["exchange"].astype(str).str.upper() == "NFO")
+        & (instruments["name"].astype(str).str.upper().isin(allowed_underlyings))
+        & (instruments["instrument_type"].astype(str).str.upper().isin(["CE", "PE"]))
+    ].copy()
+    if options.empty:
+        return {}
+    options["expiry"] = pd.to_datetime(options["expiry"], errors="coerce").dt.date
+    options["strike"] = pd.to_numeric(options["strike"], errors="coerce")
+    result = {}
+    for row in options.itertuples():
+        if pd.isna(row.strike) or pd.isna(row.expiry):
+            continue
+        key = (str(row.name).upper(), row.expiry, round(float(row.strike), 4), str(row.instrument_type).upper())
+        result[key] = row
+    return result
+
+
+def nse_bhavcopy_to_oi_rows(frame: pd.DataFrame, trade_date: object) -> list[dict]:
+    allowed_underlyings = oi_baseline_underlyings()
+    symbol_col = find_bhavcopy_column(frame, ["SYMBOL", "TckrSymb", "TICKER_SYMBOL"])
+    expiry_col = find_bhavcopy_column(frame, ["EXPIRY_DT", "XpryDt", "EXPIRY_DATE"])
+    strike_col = find_bhavcopy_column(frame, ["STRIKE_PR", "StrkPric", "STRIKE_PRICE"])
+    option_type_col = find_bhavcopy_column(frame, ["OPTION_TYP", "OptnTp", "OPTION_TYPE"])
+    oi_col = find_bhavcopy_column(frame, ["OPEN_INT", "OpnIntrst", "OPEN_INTEREST"])
+    close_col = None
+    try:
+        close_col = find_bhavcopy_column(frame, ["CLOSE", "ClsPric", "LAST", "LastPric", "SttlmPric"])
+    except ValueError:
+        pass
+
+    contracts = kite_option_contract_map()
+    rows: list[dict] = []
+    for item in frame.itertuples(index=False):
+        record = dict(zip(frame.columns, item))
+        underlying = option_underlying_symbol(str(record[symbol_col]).upper().strip())
+        option_type = str(record[option_type_col]).upper().strip()
+        if underlying not in allowed_underlyings or option_type not in {"CE", "PE"}:
+            continue
+        expiry = pd.to_datetime(record[expiry_col], errors="coerce")
+        strike = pd.to_numeric(record[strike_col], errors="coerce")
+        oi = pd.to_numeric(record[oi_col], errors="coerce")
+        if pd.isna(expiry) or pd.isna(strike) or pd.isna(oi):
+            continue
+        key = (underlying, expiry.date(), round(float(strike), 4), option_type)
+        contract = contracts.get(key)
+        if contract is None:
+            continue
+        last_price = None
+        if close_col:
+            close_value = pd.to_numeric(record[close_col], errors="coerce")
+            if not pd.isna(close_value):
+                last_price = float(close_value)
+        rows.append(
+            {
+                "trade_date": trade_date,
+                "underlying": underlying,
+                "tradingsymbol": str(contract.tradingsymbol),
+                "expiry": expiry.date(),
+                "strike": float(strike),
+                "option_type": option_type,
+                "oi": int(oi),
+                "last_price": last_price,
+                "source": "nse.bhavcopy",
+            }
+        )
+    return rows
+
+
+def save_option_oi_rows(rows: list[dict], trade_date: object, started: float) -> int:
+    if not rows:
+        log_event("option_oi_baseline.capture.empty", "warning", trade_date=str(trade_date), source="nse.bhavcopy")
+        return 0
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO option_oi_daily (
+                    trade_date,
+                    underlying,
+                    tradingsymbol,
+                    expiry,
+                    strike,
+                    option_type,
+                    oi,
+                    last_price,
+                    source
+                )
+                VALUES (
+                    %(trade_date)s,
+                    %(underlying)s,
+                    %(tradingsymbol)s,
+                    %(expiry)s,
+                    %(strike)s,
+                    %(option_type)s,
+                    %(oi)s,
+                    %(last_price)s,
+                    %(source)s
+                )
+                ON CONFLICT (trade_date, tradingsymbol)
+                DO UPDATE SET
+                    captured_at = now(),
+                    underlying = EXCLUDED.underlying,
+                    expiry = EXCLUDED.expiry,
+                    strike = EXCLUDED.strike,
+                    option_type = EXCLUDED.option_type,
+                    oi = EXCLUDED.oi,
+                    last_price = EXCLUDED.last_price,
+                    source = EXCLUDED.source
+                """,
+                rows,
+            )
+    log_event(
+        "option_oi_baseline.capture.success",
+        trade_date=str(trade_date),
+        source="nse.bhavcopy",
+        rows=len(rows),
+        underlyings=len({row["underlying"] for row in rows}),
+        duration_ms=int((time.perf_counter() - started) * 1000),
+    )
+    return len(rows)
+
+
+def save_option_oi_daily_baseline(trade_date: object) -> int:
+    if not ensure_events_table():
+        return 0
+    started = time.perf_counter()
+    frame = download_nse_fo_bhavcopy(trade_date)
+    rows = nse_bhavcopy_to_oi_rows(frame, trade_date)
+    log_event(
+        "option_oi_baseline.capture.start",
+        trade_date=str(trade_date),
+        source="nse.bhavcopy",
+        bhavcopy_rows=len(frame),
+        rows=len(rows),
+        underlyings=len({row["underlying"] for row in rows}),
+    )
+    return save_option_oi_rows(rows, trade_date, started)
+
+
+def save_latest_option_oi_baseline(max_trade_date: object | None = None) -> int:
+    max_date = pd.to_datetime(max_trade_date or datetime.now().date()).date()
+    for offset in range(nse_bhavcopy_lookback_days()):
+        trade_date = max_date - timedelta(days=offset)
+        if option_oi_baseline_exists(trade_date):
+            log_event("option_oi_baseline.skip", trade_date=str(trade_date), reason="already_exists")
+            return 0
+        try:
+            return save_option_oi_daily_baseline(trade_date)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                log_event("nse.bhavcopy.missing", "warning", trade_date=str(trade_date), status=exc.code)
+                continue
+            log_event("nse.bhavcopy.error", "error", trade_date=str(trade_date), status=exc.code, error=str(exc))
+        except (urllib.error.URLError, TimeoutError, zipfile.BadZipFile, ValueError) as exc:
+            log_event("nse.bhavcopy.error", "warning", trade_date=str(trade_date), error=str(exc))
+    log_event("option_oi_baseline.skip", "warning", reason="no_nse_bhavcopy_found", lookback_days=nse_bhavcopy_lookback_days())
+    return 0
+
+
+def oi_baseline_due_now() -> bool:
+    now = datetime.now()
+    if now.weekday() >= 5:
+        return False
+    hour, minute = oi_baseline_capture_time()
+    return now.hour > hour or (now.hour == hour and now.minute >= minute)
+
+
+def oi_baseline_scheduler_loop() -> None:
+    log_event(
+        "option_oi_baseline.scheduler.start",
+        enabled=oi_baseline_enabled(),
+        source="nse.bhavcopy",
+        capture_time="%02d:%02d" % oi_baseline_capture_time(),
+        poll_seconds=oi_baseline_poll_seconds(),
+        underlyings=len(oi_baseline_underlyings()),
+    )
+    while True:
+        try:
+            today = datetime.now().date()
+            if oi_baseline_enabled() and database_enabled() and oi_baseline_due_now():
+                save_latest_option_oi_baseline(today)
+        except Exception as exc:
+            log_event("option_oi_baseline.scheduler.error", "error", error=str(exc))
+        time.sleep(oi_baseline_poll_seconds())
+
+
+def start_oi_baseline_scheduler() -> None:
+    global OI_BASELINE_THREAD_STARTED
+    if OI_BASELINE_THREAD_STARTED:
+        return
+    OI_BASELINE_THREAD_STARTED = True
+    thread = threading.Thread(target=oi_baseline_scheduler_loop, name="oi-baseline-scheduler", daemon=True)
+    thread.start()
 
 
 def maybe_confirm_extreme_with_tradingview(result: RatingResult, interval: str) -> dict:
@@ -1440,6 +1879,11 @@ class RatingsHandler(BaseHTTPRequestHandler):
             "tradingview_confirmation": tradingview_confirmation_enabled(),
             "database_enabled": database_enabled(),
             "database_ready": DB_READY,
+            "oi_baseline_enabled": oi_baseline_enabled(),
+            "oi_baseline_capture_time": "%02d:%02d" % oi_baseline_capture_time(),
+            "oi_baseline_source": "nse.bhavcopy",
+            "nse_bhavcopy_lookback_days": nse_bhavcopy_lookback_days(),
+            "oi_baseline_thread_started": OI_BASELINE_THREAD_STARTED,
         }
         log_event("health.success", **payload)
         self._send_json(payload)
@@ -2721,6 +3165,7 @@ load().catch(showError);
 def run_server(host: str, port: int) -> None:
     validate_runtime_config(host)
     ensure_events_table()
+    start_oi_baseline_scheduler()
     server = ThreadingHTTPServer((host, port), RatingsHandler)
     log_event(
         "server.start",
@@ -2731,6 +3176,10 @@ def run_server(host: str, port: int) -> None:
         log_file=str(LOG_FILE_PATH) if LOG_FILE_PATH else "",
         tradingview_confirmation=tradingview_confirmation_enabled(),
         database_enabled=database_enabled(),
+        oi_baseline_enabled=oi_baseline_enabled(),
+        oi_baseline_capture_time="%02d:%02d" % oi_baseline_capture_time(),
+        oi_baseline_source="nse.bhavcopy",
+        nse_bhavcopy_lookback_days=nse_bhavcopy_lookback_days(),
     )
     print(f"Technical Ratings app running at http://{host}:{port}")
     if LOG_FILE_PATH:

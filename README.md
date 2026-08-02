@@ -186,6 +186,31 @@ On startup, StockRadar creates the `events` table if it does not exist. A row is
 
 The event row includes symbol, timeframe, signal, price, bars, local scores/labels, TradingView recommendations/counts, payload JSON, and request id.
 
+## Daily Option OI Baseline
+
+StockRadar can save one option OI closing snapshot per trading day from NSE's free F&O bhavcopy. This keeps option-chain `Change in OI` stable across days without storing every auto-refresh response or calling Kite quotes for previous-day OI.
+
+Add these settings to `.env`:
+
+```env
+OI_BASELINE_ENABLED=true
+OI_BASELINE_CAPTURE_TIME=08:30
+OI_BASELINE_POLL_SECONDS=60
+OI_BASELINE_UNDERLYINGS=NIFTY,ADANIENT,ADANIPORTS,APOLLOHOSP,ASIANPAINT,AXISBANK,BAJAJ-AUTO,BAJFINANCE,BAJAJFINSV,BEL,BHARTIARTL,CIPLA,COALINDIA,DRREDDY,EICHERMOT,ETERNAL,GRASIM,HCLTECH,HDFCBANK,HDFCLIFE,HEROMOTOCO,HINDALCO,HINDUNILVR,ICICIBANK,INDUSINDBK,INFY,ITC,JIOFIN,JSWSTEEL,KOTAKBANK,LT,M&M,MARUTI,NESTLEIND,NTPC,ONGC,POWERGRID,RELIANCE,SBILIFE,SBIN,SHRIRAMFIN,SUNPHARMA,TATACONSUM,TATAMOTORS,TATASTEEL,TCS,TECHM,TITAN,TRENT,ULTRACEMCO,WIPRO
+NSE_BHAVCOPY_LOOKBACK_DAYS=10
+NSE_BHAVCOPY_BASE_URL=https://nsearchives.nseindia.com/content/fo
+```
+
+How it works:
+
+- When the server is running after `OI_BASELINE_CAPTURE_TIME`, it checks once per poll interval.
+- It tries to download the latest available NSE F&O UDiFF bhavcopy within `NSE_BHAVCOPY_LOOKBACK_DAYS`, handling weekends and holidays by walking backward date by date.
+- It filters the report to the configured NIFTY index and NIFTY 50 underlyings, maps contracts to Kite tradingsymbols, then stores `trade_date`, contract, expiry, strike, option type, OI, and close price in `option_oi_daily`.
+- The option-chain screen calculates `Change in OI` as `current OI - latest saved OI before today`.
+- If no previous baseline exists for a contract, `Change in OI` is blank until the next saved trading-day baseline is available.
+
+Change `OI_BASELINE_UNDERLYINGS` if the NIFTY 50 constituents change or if you want a smaller watchlist. This requires `DATABASE_URL` and the app process running at or after the capture time. Kite quote calls are still used for live/current option-chain OI, but not for previous-day baseline OI.
+
 ## Accuracy Notes
 
 The calculation follows TradingView's public Technical Ratings rules: 15 moving-average components, 11 oscillator components, each component contributing `-1`, `0`, or `+1`. The gauge thresholds are:
