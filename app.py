@@ -319,10 +319,11 @@ def safe_error_html(title: str, message: object) -> str:
     return f"<h1>{html.escape(title)}</h1><p>{html.escape(str(message))}</p>"
 
 
-def make_session_cookie(username: str) -> str:
+def make_session_cookie(username: str, max_age: int = 12 * 60 * 60) -> str:
     payload = {
         "u": username,
         "iat": int(time.time()),
+        "ttl": max_age,
         "nonce": secrets.token_hex(12),
     }
     encoded = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode()
@@ -342,7 +343,8 @@ def verify_session_cookie(value: str) -> bool:
     except (ValueError, json.JSONDecodeError):
         return False
     age = int(time.time()) - int(payload.get("iat", 0))
-    return payload.get("u") == app_username() and 0 <= age <= 12 * 60 * 60
+    ttl = int(payload.get("ttl", 12 * 60 * 60))
+    return payload.get("u") == app_username() and 0 <= age <= ttl
 
 
 def fetch_kite_ohlcv(symbol: str, interval: str = "30m", range_: str = "2y") -> pd.DataFrame:
@@ -1635,9 +1637,10 @@ class RatingsHandler(BaseHTTPRequestHandler):
             data = urllib.parse.parse_qs(body)
             username = data.get("username", [""])[0]
             password = data.get("password", [""])[0]
+            remember = data.get("remember", [""])[0] == "on"
             if auth_configured() and username == app_username() and hmac.compare_digest(password, app_password()):
-                log_event("auth.login.success", username=username)
-                self._set_session(username)
+                log_event("auth.login.success", username=username, remember=remember)
+                self._set_session(username, remember=remember)
             else:
                 log_event("auth.login.failure", "warning", username=username, auth_configured=auth_configured())
                 self._send_html(LOGIN_HTML.replace("<!--ERROR-->", "<p class='error'>Invalid login or APP_PASSWORD is not set.</p>"), status=401)
@@ -1848,14 +1851,15 @@ class RatingsHandler(BaseHTTPRequestHandler):
         self.send_header("X-Request-ID", current_request_id())
         self.end_headers()
 
-    def _set_session(self, username: str) -> None:
+    def _set_session(self, username: str, remember: bool = False) -> None:
+        max_age = 30 * 24 * 60 * 60 if remember else 12 * 60 * 60
         secure = "; Secure" if os.environ.get("APP_COOKIE_SECURE", "").lower() in {"1", "true", "yes"} else ""
         self._response_status = 302
         self.send_response(302)
         self.send_header("Location", "/")
         self.send_header(
             "Set-Cookie",
-            f"{APP_SESSION_COOKIE}={make_session_cookie(username)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=43200{secure}",
+            f"{APP_SESSION_COOKIE}={make_session_cookie(username, max_age=max_age)}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age}{secure}",
         )
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Request-ID", current_request_id())
@@ -1880,17 +1884,19 @@ LOGIN_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Stock Console Login</title>
+  <title>StockRadar Login</title>
   <style>
     :root {
-      --bg: #f6f8fb;
-      --panel: #ffffff;
-      --text: #0b0f19;
-      --muted: #667085;
-      --line: #e3e8ef;
-      --blue: #2563ff;
-      --orange: #ff7a00;
-      --red: #f23645;
+      --page: #eef2f7;
+      --ink: #050b1c;
+      --muted: #58627a;
+      --line: #d9e0ec;
+      --dark: #0b1020;
+      --dark-2: #111a32;
+      --blue: #4072f2;
+      --violet: #7547ed;
+      --teal: #12c8c1;
+      --red: #f04452;
     }
     * { box-sizing: border-box; }
     body {
@@ -1899,117 +1905,245 @@ LOGIN_HTML = r"""<!doctype html>
       display: grid;
       place-items: center;
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Arial, sans-serif;
-      color: var(--text);
+      color: var(--ink);
       background:
-        radial-gradient(circle at 18% 18%, rgba(37, 99, 255, .14), transparent 30%),
-        radial-gradient(circle at 82% 24%, rgba(255, 122, 0, .16), transparent 28%),
-        linear-gradient(145deg, #ffffff 0%, var(--bg) 55%, #eef3ff 100%);
+        radial-gradient(circle at 25% 8%, rgba(64, 114, 242, .12), transparent 32%),
+        radial-gradient(circle at 80% 78%, rgba(18, 200, 193, .10), transparent 30%),
+        var(--page);
       padding: 24px;
     }
     .shell {
-      width: min(980px, 100%);
+      width: min(1170px, 100%);
       display: grid;
-      grid-template-columns: 1fr 410px;
-      min-height: 560px;
-      border: 1px solid var(--line);
+      grid-template-columns: 1fr 1fr;
+      min-height: 724px;
       border-radius: 22px;
-      background: rgba(255, 255, 255, .82);
-      box-shadow: 0 28px 80px rgba(15, 23, 42, .14);
+      background: #fff;
+      box-shadow: 0 34px 90px rgba(28, 39, 69, .18);
       overflow: hidden;
-      backdrop-filter: blur(18px);
     }
     .brand {
-      padding: 46px;
+      position: relative;
+      padding: 48px 44px 36px;
       display: flex;
       flex-direction: column;
       justify-content: space-between;
-      background: #0b0f19;
+      background:
+        radial-gradient(circle at 30% 38%, rgba(18, 200, 193, .22), transparent 28%),
+        linear-gradient(145deg, var(--dark), #070b17 72%);
       color: #fff;
+      overflow: hidden;
     }
-    .brand h1 {
-      margin: 0;
-      font-size: clamp(34px, 5vw, 58px);
-      line-height: .98;
+    .logo {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 22px;
+      font-weight: 900;
       letter-spacing: 0;
     }
-    .brand p {
-      margin: 18px 0 0;
-      max-width: 440px;
-      color: #aab2c1;
-      font-size: 17px;
-      line-height: 1.6;
+    .logo-mark {
+      width: 39px;
+      height: 39px;
+      display: grid;
+      place-items: center;
+      border-radius: 10px;
+      background: linear-gradient(135deg, #5068ff, #7451ef);
+      box-shadow: 0 14px 26px rgba(80, 104, 255, .28);
+    }
+    .logo-mark svg { width: 22px; height: 22px; }
+    .logo span span { color: var(--teal); }
+    .scanner {
+      align-self: center;
+      width: min(380px, 86%);
+      margin: 8px 0 4px;
+      opacity: .98;
+    }
+    .scanner text {
+      fill: #7181ad;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 4px;
+    }
+    .hero-copy h1 {
+      max-width: 420px;
+      margin: 0 0 12px;
+      font-size: 26px;
+      line-height: 1.28;
+      letter-spacing: 0;
+    }
+    .hero-copy p {
+      max-width: 420px;
+      margin: 0;
+      color: #aeb8d2;
+      font-size: 16px;
+      line-height: 1.55;
     }
     .chips {
       display: flex;
       flex-wrap: wrap;
       gap: 10px;
-      margin-top: 30px;
+      margin-top: 24px;
     }
     .chip {
-      border: 1px solid rgba(255,255,255,.18);
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid rgba(136, 156, 211, .28);
       border-radius: 999px;
-      padding: 8px 12px;
-      color: #d8deea;
-      font-weight: 700;
+      padding: 7px 12px;
+      color: #b9c3dc;
+      font-weight: 800;
       font-size: 13px;
+      background: rgba(11, 16, 32, .35);
+    }
+    .chip::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--teal);
+      box-shadow: 0 0 14px rgba(18, 200, 193, .8);
+    }
+    .ticker {
+      height: 54px;
+      display: flex;
+      align-items: center;
+      gap: 28px;
+      margin-top: 28px;
+      padding-top: 18px;
+      border-top: 1px solid rgba(136, 156, 211, .25);
+      color: #9aa7c3;
+      font-size: 13px;
+      font-weight: 900;
+      white-space: nowrap;
+      overflow: hidden;
+    }
+    .ticker strong { color: #f4f7ff; }
+    .ticker .up { color: #19c37d; }
     }
     .panel {
-      padding: 42px;
+      padding: clamp(42px, 6vw, 62px);
       display: flex;
       flex-direction: column;
       justify-content: center;
-      background: var(--panel);
+      background: #fff;
+    }
+    .eyebrow {
+      margin: 0 0 14px;
+      color: #007f76;
+      font-size: 13px;
+      font-weight: 900;
+      letter-spacing: .04em;
+      text-transform: uppercase;
     }
     .panel h2 {
-      margin: 0 0 8px;
-      font-size: 28px;
+      margin: 0 0 10px;
+      font-size: clamp(30px, 4vw, 36px);
+      line-height: 1.1;
       letter-spacing: 0;
     }
     .panel .sub {
-      margin: 0 0 28px;
+      margin: 0 0 34px;
       color: var(--muted);
-      line-height: 1.5;
+      line-height: 1.55;
+      font-size: 16px;
     }
     label {
       display: block;
-      margin: 16px 0 7px;
-      color: #344054;
+      margin: 18px 0 8px;
+      color: #071126;
       font-weight: 800;
       font-size: 14px;
     }
+    .field {
+      position: relative;
+    }
+    .field-icon {
+      position: absolute;
+      left: 17px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: #6a46c8;
+      width: 18px;
+      height: 18px;
+      pointer-events: none;
+    }
+    .field-icon svg {
+      width: 18px;
+      height: 18px;
+      display: block;
+    }
     input {
       width: 100%;
-      height: 46px;
-      border: 1px solid #d0d7e2;
+      height: 54px;
+      border: 1px solid var(--line);
       border-radius: 10px;
-      padding: 0 13px;
+      padding: 0 16px 0 46px;
       font: inherit;
-      font-weight: 650;
+      font-weight: 750;
       outline: none;
+      color: #101828;
+      background: #fbfcff;
       transition: border-color .18s, box-shadow .18s;
     }
     input:focus {
       border-color: var(--blue);
-      box-shadow: 0 0 0 4px rgba(37, 99, 255, .12);
+      box-shadow: 0 0 0 4px rgba(64, 114, 242, .12);
+      background: #fff;
+    }
+    .row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-top: 18px;
+      color: #465271;
+      font-size: 14px;
+      font-weight: 700;
+    }
+    .remember {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      margin: 0;
+      color: #465271;
+      font-size: 14px;
+    }
+    .remember input {
+      width: 18px;
+      height: 18px;
+      padding: 0;
+      accent-color: var(--blue);
+    }
+    .security-note {
+      color: #2356d8;
+      text-decoration: none;
     }
     button {
       width: 100%;
-      height: 48px;
-      margin-top: 24px;
+      height: 54px;
+      margin-top: 34px;
       border: 0;
       border-radius: 10px;
       color: #fff;
-      background: linear-gradient(90deg, var(--blue), #6938ef);
+      background: linear-gradient(92deg, var(--blue), var(--violet));
       font: inherit;
       font-weight: 900;
       cursor: pointer;
-      box-shadow: 0 12px 26px rgba(37, 99, 255, .25);
+      box-shadow: 0 16px 28px rgba(64, 114, 242, .28);
+      transition: transform .16s, box-shadow .16s;
+    }
+    button:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 20px 34px rgba(64, 114, 242, .32);
     }
     .setup, .error {
       border-radius: 10px;
-      padding: 12px 13px;
+      padding: 12px 14px;
       font-size: 14px;
       line-height: 1.45;
+      margin: 0 0 18px;
     }
     .setup {
       color: #7a4100;
@@ -2022,7 +2156,7 @@ LOGIN_HTML = r"""<!doctype html>
       border: 1px solid #ffc9d0;
     }
     .foot {
-      margin-top: 18px;
+      margin-top: 22px;
       color: var(--muted);
       font-size: 13px;
       line-height: 1.45;
@@ -2031,38 +2165,104 @@ LOGIN_HTML = r"""<!doctype html>
       color: #111827;
       font-weight: 800;
     }
-    @media (max-width: 820px) {
+    @media (max-width: 860px) {
       .shell { grid-template-columns: 1fr; }
-      .brand { min-height: 280px; padding: 32px; }
-      .panel { padding: 30px; }
+      .brand { min-height: 560px; padding: 34px; }
+      .panel { padding: 34px; }
+      .scanner { width: min(340px, 92%); }
+    }
+    @media (max-width: 520px) {
+      body { padding: 14px; }
+      .shell { border-radius: 18px; }
+      .brand { min-height: 480px; padding: 28px 24px; }
+      .panel { padding: 30px 22px; }
+      .row { align-items: flex-start; flex-direction: column; }
     }
   </style>
 </head>
 <body>
   <main class="shell">
     <section class="brand">
-      <div>
-        <h1>Stock Market Console</h1>
-        <p>Technical ratings, Kite option chain, and live market views behind a private session.</p>
+      <div class="logo">
+        <span class="logo-mark">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M5 16l4-4 3 3 7-8" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M15 7h4v4" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </span>
+        <span>Stock<span>Radar</span></span>
+      </div>
+      <svg class="scanner" viewBox="0 0 360 330" role="img" aria-label="Market scanner">
+        <defs>
+          <radialGradient id="scanGlow" cx="38%" cy="48%" r="58%">
+            <stop offset="0%" stop-color="#19d3ca" stop-opacity=".55"/>
+            <stop offset="58%" stop-color="#19d3ca" stop-opacity=".12"/>
+            <stop offset="100%" stop-color="#19d3ca" stop-opacity="0"/>
+          </radialGradient>
+        </defs>
+        <text x="180" y="24" text-anchor="middle">SCANNING MARKET</text>
+        <circle cx="180" cy="168" r="150" fill="none" stroke="#24304d"/>
+        <circle cx="180" cy="168" r="108" fill="none" stroke="#24304d"/>
+        <circle cx="180" cy="168" r="67" fill="none" stroke="#24304d"/>
+        <circle cx="180" cy="168" r="32" fill="none" stroke="#24304d"/>
+        <path d="M30 168a150 150 0 0 1 150-150v150z" fill="url(#scanGlow)"/>
+        <path d="M30 168h300M180 18v300" stroke="#263250"/>
+        <circle cx="180" cy="168" r="3.5" fill="#edf4ff"/>
+        <g fill="none" stroke-width="2.2">
+          <circle cx="142" cy="76" r="9" stroke="#ef4456"/><circle cx="142" cy="76" r="3" fill="#ef4456" stroke="none"/>
+          <circle cx="252" cy="96" r="9" stroke="#12c8a8"/><circle cx="252" cy="96" r="3" fill="#12c8a8" stroke="none"/>
+          <circle cx="307" cy="148" r="9" stroke="#12c8a8"/><circle cx="307" cy="148" r="3" fill="#12c8a8" stroke="none"/>
+          <circle cx="240" cy="252" r="9" stroke="#12c8a8"/><circle cx="240" cy="252" r="3" fill="#12c8a8" stroke="none"/>
+          <circle cx="130" cy="222" r="9" stroke="#ef4456"/><circle cx="130" cy="222" r="3" fill="#ef4456" stroke="none"/>
+        </g>
+      </svg>
+      <div class="hero-copy">
+        <h1>Every signal, every strike, one dashboard.</h1>
+        <p>Live oscillator and moving-average ratings, full option chains, and Kite-linked market data behind one private session.</p>
         <div class="chips">
           <span class="chip">Kite Connect</span>
-          <span class="chip">NSE Stocks</span>
-          <span class="chip">Technical Ratings</span>
-          <span class="chip">Option Chain</span>
+          <span class="chip">NSE stocks</span>
+          <span class="chip">Option chain</span>
         </div>
       </div>
-      <p>Use HTTPS and a strong password before exposing this server publicly.</p>
+      <div class="ticker">
+        <span>RELIANCE <strong>2,912.40</strong> <span class="up">Buy</span></span>
+        <span>TCS <strong>4,105.10</strong> <span class="up">Buy</span></span>
+        <span>HDFCBANK <strong>1,688.75</strong></span>
+      </div>
     </section>
     <section class="panel">
-      <h2>Sign In</h2>
-      <p class="sub">Access your market dashboard.</p>
+      <p class="eyebrow">Private Session</p>
+      <h2>Sign in to StockRadar</h2>
+      <p class="sub">Enter your credentials to access your dashboard.</p>
       <!--ERROR-->
       <form method="post" action="/login">
         <label for="username">Username</label>
-        <input id="username" name="username" value="admin" autocomplete="username" required>
+        <div class="field">
+          <span class="field-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none">
+              <path d="M20 21a8 8 0 0 0-16 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+              <circle cx="12" cy="8" r="4" fill="currentColor"/>
+            </svg>
+          </span>
+          <input id="username" name="username" value=""" + html.escape(app_username()) + r""" autocomplete="username" required>
+        </div>
         <label for="password">Password</label>
-        <input id="password" name="password" type="password" autocomplete="current-password" required>
-        <button type="submit">Enter Dashboard</button>
+        <div class="field">
+          <span class="field-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none">
+              <rect x="5" y="10" width="14" height="10" rx="2" fill="currentColor" opacity=".18"/>
+              <path d="M8 10V7a4 4 0 0 1 8 0v3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+              <path d="M12 14v3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            </svg>
+          </span>
+          <input id="password" name="password" type="password" autocomplete="current-password" required>
+        </div>
+        <div class="row">
+          <label class="remember"><input type="checkbox" name="remember">Remember this device</label>
+          <span class="security-note">Secure session</span>
+        </div>
+        <button type="submit">Enter dashboard -></button>
       </form>
       <p class="foot">Set <code>APP_USERNAME</code>, <code>APP_PASSWORD</code>, and <code>APP_SESSION_SECRET</code> before public deployment.</p>
       """ + ("" if auth_configured() else "<p class='setup'>APP_PASSWORD is not set. Login is disabled until you configure it.</p>") + r"""
