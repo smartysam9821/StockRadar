@@ -137,6 +137,7 @@ REQUEST_CONTEXT = threading.local()
 DB_LOCK = threading.RLock()
 DB_READY = False
 OI_BASELINE_THREAD_STARTED = False
+SIGNAL_SCANNER_THREAD_STARTED = False
 TV_CONFIRMATION_LOCK = threading.RLock()
 TV_CONFIRMATION_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
 TV_INTERVALS = {
@@ -281,7 +282,7 @@ def oi_baseline_capture_time() -> tuple[int, int]:
     value = os.environ.get("OI_BASELINE_CAPTURE_TIME", "09:20").strip()
     match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", value)
     if not match:
-        return 15, 35
+        return 9, 20
     return int(match.group(1)), int(match.group(2))
 
 
@@ -299,6 +300,60 @@ def oi_baseline_underlyings() -> set[str]:
         if item.strip()
     }
     return values or set(DEFAULT_OI_BASELINE_UNDERLYINGS)
+
+
+def background_signal_scanner_enabled() -> bool:
+    return os.environ.get("BACKGROUND_SIGNAL_SCANNER_ENABLED", "false").lower() in {"1", "true", "yes"}
+
+
+def background_signal_scanner_symbols() -> list[str]:
+    configured = os.environ.get("BACKGROUND_SIGNAL_SCANNER_SYMBOLS", DEFAULT_SYMBOL).strip()
+    symbols = []
+    seen = set()
+    for item in configured.split(","):
+        raw = item.strip()
+        if not raw:
+            continue
+        try:
+            symbol = validate_symbol(raw)
+        except ValueError as exc:
+            log_event("signal_scanner.symbol.skip", "warning", symbol=raw, error=str(exc))
+            continue
+        if symbol not in seen:
+            seen.add(symbol)
+            symbols.append(symbol)
+    return symbols or [DEFAULT_SYMBOL]
+
+
+def background_signal_scanner_intervals() -> list[str]:
+    configured = os.environ.get("BACKGROUND_SIGNAL_SCANNER_INTERVALS", "5m,15m").strip()
+    intervals = []
+    seen = set()
+    for item in configured.split(","):
+        raw = item.strip()
+        if not raw:
+            continue
+        try:
+            interval = validate_interval(raw)
+        except ValueError as exc:
+            log_event("signal_scanner.interval.skip", "warning", interval=raw, error=str(exc))
+            continue
+        if interval not in seen:
+            seen.add(interval)
+            intervals.append(interval)
+    return intervals or ["5m"]
+
+
+def background_signal_scanner_range() -> str:
+    return validate_range(os.environ.get("BACKGROUND_SIGNAL_SCANNER_RANGE", "2y").strip() or "2y")
+
+
+def background_signal_scanner_poll_seconds() -> int:
+    return parse_int(os.environ.get("BACKGROUND_SIGNAL_SCANNER_POLL_SECONDS", "60"), 60, 10, 3600)
+
+
+def background_signal_scanner_delay_seconds() -> float:
+    return parse_int(os.environ.get("BACKGROUND_SIGNAL_SCANNER_DELAY_SECONDS", "2"), 2, 0, 60)
 
 
 def safe_error_html(title: str, message: object) -> str:
@@ -951,8 +1006,19 @@ def ensure_events_table() -> bool:
                         ALTER COLUMN source SET DEFAULT 'kite.quote.opening'
                         """
                     )
+                    cur.execute(
+                        """
+                        DELETE FROM option_oi_daily
+                        WHERE source = 'nse.bhavcopy'
+                        """
+                    )
+                    deleted_bhavcopy_rows = cur.rowcount
             DB_READY = True
-            log_event("db.events_table.ready", duration_ms=int((time.perf_counter() - started) * 1000))
+            log_event(
+                "db.events_table.ready",
+                deleted_bhavcopy_rows=deleted_bhavcopy_rows,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
             return True
         except Exception as exc:
             log_event(
@@ -1059,6 +1125,48 @@ def store_confirmed_event(result: RatingResult, interval: str, bars: int, tv: di
             duration_ms=int((time.perf_counter() - started) * 1000),
         )
         return False
+
+
+def evaluate_and_store_rating_signal(
+    symbol: str,
+    interval: str,
+    range_: str,
+    *,
+    source: str,
+    csv_path: str = "",
+) -> dict:
+    started = time.perf_counter()
+    symbol = validate_symbol(symbol)
+    interval = validate_interval(interval)
+    range_ = validate_range(range_)
+    if csv_path and not http_csv_enabled():
+        raise ValueError("HTTP CSV loading is disabled. Use CLI CSV mode or set APP_ALLOW_HTTP_CSV=true.")
+    df = load_csv(csv_path) if csv_path else fetch_kite_ohlcv(symbol, interval, range_)
+    result = technical_ratings(df, symbol=symbol)
+    confirmation = maybe_confirm_extreme_with_tradingview(result, interval)
+    event_stored = store_confirmed_event(result, interval, len(df), confirmation)
+    payload = {
+        "result": result,
+        "bars": len(df),
+        "confirmation": confirmation,
+        "event_stored": event_stored,
+        "duration_ms": int((time.perf_counter() - started) * 1000),
+    }
+    log_event(
+        "ratings.evaluate.success",
+        source=source,
+        symbol=symbol,
+        interval=interval,
+        bars=payload["bars"],
+        overall=result.overall_label,
+        oscillators=result.oscillator_label,
+        moving_averages=result.ma_label,
+        confirmation_checked=confirmation.get("checked", False),
+        confirmation_applied=confirmation.get("applied", False),
+        event_stored=event_stored,
+        duration_ms=payload["duration_ms"],
+    )
+    return payload
 
 
 def option_oi_baseline_exists(trade_date: object) -> bool:
@@ -1250,6 +1358,75 @@ def start_oi_baseline_scheduler() -> None:
         return
     OI_BASELINE_THREAD_STARTED = True
     thread = threading.Thread(target=oi_baseline_scheduler_loop, name="oi-baseline-scheduler", daemon=True)
+    thread.start()
+
+
+def signal_scanner_loop() -> None:
+    log_event(
+        "signal_scanner.scheduler.start",
+        enabled=background_signal_scanner_enabled(),
+        symbols=background_signal_scanner_symbols(),
+        intervals=background_signal_scanner_intervals(),
+        range=background_signal_scanner_range(),
+        poll_seconds=background_signal_scanner_poll_seconds(),
+        delay_seconds=background_signal_scanner_delay_seconds(),
+    )
+    while True:
+        poll_started = time.perf_counter()
+        try:
+            if not background_signal_scanner_enabled():
+                log_event("signal_scanner.scheduler.skip", reason="disabled")
+            elif not database_enabled():
+                log_event("signal_scanner.scheduler.skip", "warning", reason="database_url_missing")
+            elif not current_kite_access_token():
+                log_event("signal_scanner.scheduler.skip", "warning", reason="kite_not_connected")
+            else:
+                symbols = background_signal_scanner_symbols()
+                intervals = background_signal_scanner_intervals()
+                range_ = background_signal_scanner_range()
+                log_event("signal_scanner.poll.start", symbols=len(symbols), intervals=intervals, range=range_)
+                scanned = 0
+                stored = 0
+                for symbol in symbols:
+                    for interval in intervals:
+                        try:
+                            evaluated = evaluate_and_store_rating_signal(
+                                symbol,
+                                interval,
+                                range_,
+                                source="background_scanner",
+                            )
+                            scanned += 1
+                            if evaluated["event_stored"]:
+                                stored += 1
+                        except Exception as exc:
+                            log_event(
+                                "signal_scanner.symbol.error",
+                                "error",
+                                symbol=symbol,
+                                interval=interval,
+                                error=str(exc),
+                            )
+                        delay = background_signal_scanner_delay_seconds()
+                        if delay:
+                            time.sleep(delay)
+                log_event(
+                    "signal_scanner.poll.success",
+                    scanned=scanned,
+                    event_stored=stored,
+                    duration_ms=int((time.perf_counter() - poll_started) * 1000),
+                )
+        except Exception as exc:
+            log_event("signal_scanner.scheduler.error", "error", error=str(exc))
+        time.sleep(background_signal_scanner_poll_seconds())
+
+
+def start_signal_scanner_scheduler() -> None:
+    global SIGNAL_SCANNER_THREAD_STARTED
+    if SIGNAL_SCANNER_THREAD_STARTED:
+        return
+    SIGNAL_SCANNER_THREAD_STARTED = True
+    thread = threading.Thread(target=signal_scanner_loop, name="signal-scanner-scheduler", daemon=True)
     thread.start()
 
 
@@ -1616,17 +1793,21 @@ class RatingsHandler(BaseHTTPRequestHandler):
         csv_path = params.get("csv", [""])[0].strip()
         log_event("ratings.request.start", symbol=symbol, interval=interval, range=range_, csv=bool(csv_path))
         try:
-            if csv_path and not http_csv_enabled():
-                raise ValueError("HTTP CSV loading is disabled. Use CLI CSV mode or set APP_ALLOW_HTTP_CSV=true.")
-            df = load_csv(csv_path) if csv_path else fetch_kite_ohlcv(symbol, interval, range_)
-            result = technical_ratings(df, symbol=symbol)
-            confirmation = maybe_confirm_extreme_with_tradingview(result, validate_interval(interval))
-            event_stored = store_confirmed_event(result, validate_interval(interval), len(df), confirmation)
+            evaluated = evaluate_and_store_rating_signal(
+                symbol,
+                interval,
+                range_,
+                source="api",
+                csv_path=csv_path,
+            )
+            result = evaluated["result"]
+            confirmation = evaluated["confirmation"]
+            event_stored = evaluated["event_stored"]
             log_event(
                 "ratings.request.success",
-                symbol=symbol,
-                interval=interval,
-                bars=len(df),
+                symbol=validate_symbol(symbol),
+                interval=validate_interval(interval),
+                bars=evaluated["bars"],
                 overall=result.overall_label,
                 oscillators=result.oscillator_label,
                 moving_averages=result.ma_label,
@@ -1639,7 +1820,7 @@ class RatingsHandler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "data": result_to_dict(result),
-                    "bars": len(df),
+                    "bars": evaluated["bars"],
                     "confirmation": confirmation,
                     "event_stored": event_stored,
                 }
@@ -1718,6 +1899,12 @@ class RatingsHandler(BaseHTTPRequestHandler):
             "oi_baseline_capture_time": "%02d:%02d" % oi_baseline_capture_time(),
             "oi_baseline_source": "kite.quote.opening",
             "oi_baseline_thread_started": OI_BASELINE_THREAD_STARTED,
+            "signal_scanner_enabled": background_signal_scanner_enabled(),
+            "signal_scanner_thread_started": SIGNAL_SCANNER_THREAD_STARTED,
+            "signal_scanner_symbols": background_signal_scanner_symbols(),
+            "signal_scanner_intervals": background_signal_scanner_intervals(),
+            "signal_scanner_range": background_signal_scanner_range(),
+            "signal_scanner_poll_seconds": background_signal_scanner_poll_seconds(),
         }
         log_event("health.success", **payload)
         self._send_json(payload)
@@ -3821,6 +4008,7 @@ def run_server(host: str, port: int) -> None:
     validate_runtime_config(host)
     ensure_events_table()
     start_oi_baseline_scheduler()
+    start_signal_scanner_scheduler()
     server = ThreadingHTTPServer((host, port), RatingsHandler)
     log_event(
         "server.start",
@@ -3834,6 +4022,12 @@ def run_server(host: str, port: int) -> None:
         oi_baseline_enabled=oi_baseline_enabled(),
         oi_baseline_capture_time="%02d:%02d" % oi_baseline_capture_time(),
         oi_baseline_source="kite.quote.opening",
+        signal_scanner_enabled=background_signal_scanner_enabled(),
+        signal_scanner_thread_started=SIGNAL_SCANNER_THREAD_STARTED,
+        signal_scanner_symbols=background_signal_scanner_symbols(),
+        signal_scanner_intervals=background_signal_scanner_intervals(),
+        signal_scanner_range=background_signal_scanner_range(),
+        signal_scanner_poll_seconds=background_signal_scanner_poll_seconds(),
     )
     print(f"Technical Ratings app running at http://{host}:{port}")
     if LOG_FILE_PATH:

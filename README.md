@@ -138,6 +138,28 @@ TRADINGVIEW_CONFIRMATION_TTL_SECONDS=300
 
 Increase `TRADINGVIEW_CONFIRMATION_TTL_SECONDS` if you want fewer TradingView requests during auto-refresh.
 
+## Background Signal Scanner
+
+StockRadar can run a background scanner that periodically fetches Kite candles, calculates local technical ratings, checks TradingView only when the three local gauges align on buy/sell, and inserts a row into `events` only when TradingView confirms all three groups as `STRONG_BUY` or `STRONG_SELL`.
+
+Add these settings to `.env`:
+
+```env
+BACKGROUND_SIGNAL_SCANNER_ENABLED=true
+BACKGROUND_SIGNAL_SCANNER_SYMBOLS=ASIANPAINT.NS,NIFTY 50
+BACKGROUND_SIGNAL_SCANNER_INTERVALS=5m,15m
+BACKGROUND_SIGNAL_SCANNER_RANGE=2y
+BACKGROUND_SIGNAL_SCANNER_POLL_SECONDS=60
+BACKGROUND_SIGNAL_SCANNER_DELAY_SECONDS=2
+```
+
+Notes:
+
+- The scanner uses the same event logging logic as `/api/ratings`.
+- `BACKGROUND_SIGNAL_SCANNER_SYMBOLS` is comma-separated and accepts normal stock symbols plus index aliases such as `NIFTY 50`.
+- `BACKGROUND_SIGNAL_SCANNER_INTERVALS` must use supported app intervals: `5m` and `15m`.
+- Keep `BACKGROUND_SIGNAL_SCANNER_DELAY_SECONDS` above `0` when scanning many symbols to avoid bursts of Kite/TradingView requests.
+
 ## Logging
 
 StockRadar writes structured JSON logs to stdout and, by default, to:
