@@ -5,7 +5,6 @@ import base64
 import difflib
 import hmac
 import html
-import io
 import json
 import logging
 import os
@@ -15,11 +14,8 @@ import sys
 import tempfile
 import threading
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
-import zipfile
-import http.cookiejar
 from http import cookies
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -67,7 +63,7 @@ KITE_INSTRUMENT_CACHE = DATA_DIR / "kite_instruments.csv"
 KITE_TOKEN_FILE = DATA_DIR / "kite_access_token.json"
 KITE_ACCESS_TOKEN_MEMORY = ""
 APP_SESSION_COOKIE = "stock_app_session"
-ALLOWED_INTERVALS = {"1m", "5m", "15m", "30m"}
+ALLOWED_INTERVALS = {"5m", "15m"}
 ALLOWED_RANGES = {"1d", "5d", "7d", "30d", "60d", "90d", "6mo", "1y", "2y", "5y", "10y", "max"}
 SYMBOL_RE = re.compile(r"^(?:[A-Z]{2,5}:)?[A-Z0-9&.\- ]{1,40}(?:\.NS)?$")
 INDEX_OPTION_UNDERLYING_ALIASES = {
@@ -144,10 +140,8 @@ OI_BASELINE_THREAD_STARTED = False
 TV_CONFIRMATION_LOCK = threading.RLock()
 TV_CONFIRMATION_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
 TV_INTERVALS = {
-    "1m": "1m",
     "5m": "5m",
     "15m": "15m",
-    "30m": "30m",
 }
 
 
@@ -284,7 +278,7 @@ def oi_baseline_enabled() -> bool:
 
 
 def oi_baseline_capture_time() -> tuple[int, int]:
-    value = os.environ.get("OI_BASELINE_CAPTURE_TIME", "15:35").strip()
+    value = os.environ.get("OI_BASELINE_CAPTURE_TIME", "09:20").strip()
     match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", value)
     if not match:
         return 15, 35
@@ -293,14 +287,6 @@ def oi_baseline_capture_time() -> tuple[int, int]:
 
 def oi_baseline_poll_seconds() -> int:
     return parse_int(os.environ.get("OI_BASELINE_POLL_SECONDS", "60"), 60, 30, 3600)
-
-
-def nse_bhavcopy_lookback_days() -> int:
-    return parse_int(os.environ.get("NSE_BHAVCOPY_LOOKBACK_DAYS", "10"), 10, 1, 30)
-
-
-def nse_bhavcopy_base_url() -> str:
-    return os.environ.get("NSE_BHAVCOPY_BASE_URL", "https://nsearchives.nseindia.com/content/fo").rstrip("/")
 
 
 def oi_baseline_underlyings() -> set[str]:
@@ -347,7 +333,7 @@ def verify_session_cookie(value: str) -> bool:
     return payload.get("u") == app_username() and 0 <= age <= ttl
 
 
-def fetch_kite_ohlcv(symbol: str, interval: str = "30m", range_: str = "2y") -> pd.DataFrame:
+def fetch_kite_ohlcv(symbol: str, interval: str = "5m", range_: str = "2y") -> pd.DataFrame:
     started = time.perf_counter()
     symbol = validate_symbol(symbol)
     interval = validate_interval(interval)
@@ -495,10 +481,8 @@ def tradingview_symbol(tradingsymbol: str) -> str:
 
 def kite_source_interval(interval: str) -> str:
     mapping = {
-        "1m": "minute",
         "5m": "5minute",
         "15m": "15minute",
-        "30m": "30minute",
     }
     if interval not in mapping:
         raise ValueError(f"Kite interval not supported: {interval}")
@@ -508,10 +492,8 @@ def kite_source_interval(interval: str) -> str:
 def kite_date_window(interval: str, requested_range: str) -> tuple[datetime, datetime]:
     to_dt = datetime.now().replace(microsecond=0)
     minimum_days = {
-        "1m": 10,
         "5m": 30,
         "15m": 75,
-        "30m": 120,
     }
     days = minimum_days.get(interval, 120)
     return to_dt - timedelta(days=days), to_dt
@@ -699,10 +681,11 @@ def fetch_option_chain(symbol: str, expiry: str = "", strikes_each_side: int = 8
     if selected_expiry not in expiries:
         selected_expiry = future_expiries[0]
 
-    chain = options[options["expiry"] == selected_expiry].copy()
-    chain["strike"] = pd.to_numeric(chain["strike"], errors="coerce")
-    spot = kite_spot_price(underlying)
-    strikes = sorted(chain["strike"].dropna().unique())
+    expiry_chain = options[options["expiry"] == selected_expiry].copy()
+    expiry_chain["strike"] = pd.to_numeric(expiry_chain["strike"], errors="coerce")
+    spot_snapshot = kite_spot_snapshot(underlying)
+    spot = spot_snapshot["last_price"]
+    strikes = sorted(expiry_chain["strike"].dropna().unique())
     if not strikes:
         raise ValueError(f"No strikes found for {underlying} {selected_expiry}.")
 
@@ -710,12 +693,13 @@ def fetch_option_chain(symbol: str, expiry: str = "", strikes_each_side: int = 8
     start = max(0, atm_index - strikes_each_side)
     end = min(len(strikes), atm_index + strikes_each_side + 1)
     selected_strikes = strikes[start:end]
-    chain = chain[chain["strike"].isin(selected_strikes)]
+    chain = expiry_chain[expiry_chain["strike"].isin(selected_strikes)]
 
-    contract_symbols = [str(row.tradingsymbol) for row in chain.itertuples()]
-    previous_oi = load_previous_oi_baselines(contract_symbols, datetime.now().date())
-    keys = [f"NFO:{symbol}" for symbol in contract_symbols]
-    quotes = kite_client().quote(*keys) if keys else {}
+    all_symbols = [str(row.tradingsymbol) for row in expiry_chain.itertuples()]
+    previous_oi = load_kite_oi_baselines(all_symbols, datetime.now().date())
+    keys = [f"NFO:{symbol}" for symbol in all_symbols]
+    quotes = kite_quote_snapshot(keys)
+    totals = full_expiry_option_totals(expiry_chain, previous_oi, quotes)
     by_strike: dict[float, dict] = {}
     for row in chain.itertuples():
         strike_row = by_strike.setdefault(float(row.strike), {"strike": float(row.strike)})
@@ -728,8 +712,11 @@ def fetch_option_chain(symbol: str, expiry: str = "", strikes_each_side: int = 8
         "symbol": underlying,
         "option_underlying": option_underlying,
         "spot": spot,
+        "vwap": spot_snapshot.get("average_price"),
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
         "expiry": selected_expiry.isoformat(),
         "expiries": [item.isoformat() for item in future_expiries[:12]],
+        "totals": totals,
         "rows": rows,
     }
     log_event(
@@ -743,10 +730,18 @@ def fetch_option_chain(symbol: str, expiry: str = "", strikes_each_side: int = 8
     return payload
 
 
-def kite_spot_price(underlying: str) -> float:
+def kite_spot_snapshot(underlying: str) -> dict:
     quote_key = f"NSE:{underlying}"
-    ltp = kite_client().ltp(quote_key)
-    return float(ltp[quote_key]["last_price"])
+    kite = kite_client()
+    try:
+        quote = kite.quote(quote_key).get(quote_key, {})
+        return {
+            "last_price": float(quote["last_price"]),
+            "average_price": quote.get("average_price"),
+        }
+    except Exception:
+        ltp = kite.ltp(quote_key)
+        return {"last_price": float(ltp[quote_key]["last_price"]), "average_price": None}
 
 
 def option_quote_payload(row, quote: dict, previous_oi: int | None = None) -> dict:
@@ -754,11 +749,12 @@ def option_quote_payload(row, quote: dict, previous_oi: int | None = None) -> di
     if current_oi is not None and previous_oi is not None:
         oi_change = int(current_oi) - int(previous_oi)
     else:
-        oi_change = quote.get("oi_change") or quote.get("change_in_oi") or quote.get("oi_day_change")
+        oi_change = 0
     return {
         "tradingsymbol": row.tradingsymbol,
         "ltp": quote.get("last_price"),
         "change": quote.get("net_change"),
+        "average_price": quote.get("average_price"),
         "oi": current_oi,
         "previous_oi": previous_oi,
         "oi_change": oi_change,
@@ -766,6 +762,41 @@ def option_quote_payload(row, quote: dict, previous_oi: int | None = None) -> di
         "bid": best_depth_price(quote, "buy"),
         "ask": best_depth_price(quote, "sell"),
     }
+
+
+def kite_quote_snapshot(keys: list[str]) -> dict:
+    if not keys:
+        return {}
+    kite = kite_client()
+    quotes = {}
+    chunk_size = 500
+    for index in range(0, len(keys), chunk_size):
+        chunk = keys[index : index + chunk_size]
+        quotes.update(kite.quote(*chunk))
+    return quotes
+
+
+def full_expiry_option_totals(expiry_chain: pd.DataFrame, previous_oi: dict[str, int], quotes: dict) -> dict:
+    totals = {
+        "CE": {"oi": 0, "previous_oi": 0, "oi_change": 0},
+        "PE": {"oi": 0, "previous_oi": 0, "oi_change": 0},
+    }
+    for row in expiry_chain.itertuples():
+        side = str(row.instrument_type).upper()
+        if side not in totals:
+            continue
+        current_oi = quotes.get(f"NFO:{row.tradingsymbol}", {}).get("oi")
+        previous = previous_oi.get(str(row.tradingsymbol))
+        current = pd.to_numeric(current_oi, errors="coerce")
+        if pd.isna(current):
+            current = None
+        if current is not None:
+            totals[side]["oi"] += int(current)
+        if previous is not None:
+            totals[side]["previous_oi"] += int(previous)
+            if current is not None:
+                totals[side]["oi_change"] += int(current) - int(previous)
+    return totals
 
 
 def best_depth_price(quote: dict, side: str) -> float | None:
@@ -897,7 +928,7 @@ def ensure_events_table() -> bool:
                             option_type TEXT NOT NULL CHECK (option_type IN ('CE', 'PE')),
                             oi BIGINT NOT NULL,
                             last_price DOUBLE PRECISION,
-                            source TEXT NOT NULL DEFAULT 'nse.bhavcopy',
+                            source TEXT NOT NULL DEFAULT 'kite.quote.opening',
                             UNIQUE (trade_date, tradingsymbol)
                         )
                         """
@@ -917,7 +948,7 @@ def ensure_events_table() -> bool:
                     cur.execute(
                         """
                         ALTER TABLE option_oi_daily
-                        ALTER COLUMN source SET DEFAULT 'nse.bhavcopy'
+                        ALTER COLUMN source SET DEFAULT 'kite.quote.opening'
                         """
                     )
             DB_READY = True
@@ -1035,11 +1066,14 @@ def option_oi_baseline_exists(trade_date: object) -> bool:
         return False
     with db_connect() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM option_oi_daily WHERE trade_date = %s LIMIT 1", (trade_date,))
+            cur.execute(
+                "SELECT 1 FROM option_oi_daily WHERE trade_date = %s AND source LIKE 'kite.quote%%' LIMIT 1",
+                (trade_date,),
+            )
             return cur.fetchone() is not None
 
 
-def load_previous_oi_baselines(tradingsymbols: list[str], trade_date: object) -> dict[str, int]:
+def load_kite_oi_baselines(tradingsymbols: list[str], trade_date: object) -> dict[str, int]:
     if not tradingsymbols or not database_enabled() or psycopg is None:
         return {}
     if not ensure_events_table():
@@ -1048,7 +1082,9 @@ def load_previous_oi_baselines(tradingsymbols: list[str], trade_date: object) ->
     sql = f"""
         SELECT DISTINCT ON (tradingsymbol) tradingsymbol, oi
         FROM option_oi_daily
-        WHERE tradingsymbol IN ({placeholders}) AND trade_date < %s
+        WHERE tradingsymbol IN ({placeholders})
+            AND trade_date <= %s
+            AND source LIKE 'kite.quote%%'
         ORDER BY tradingsymbol, trade_date DESC
     """
     try:
@@ -1061,152 +1097,10 @@ def load_previous_oi_baselines(tradingsymbols: list[str], trade_date: object) ->
         return {}
 
 
-def nse_bhavcopy_filename(trade_date: object) -> str:
-    date_value = pd.to_datetime(trade_date).strftime("%Y%m%d")
-    return f"BhavCopy_NSE_FO_0_0_0_{date_value}_F_0000.csv.zip"
-
-
-def nse_bhavcopy_url(trade_date: object) -> str:
-    return f"{nse_bhavcopy_base_url()}/{nse_bhavcopy_filename(trade_date)}"
-
-
-def nse_request_headers() -> dict[str, str]:
-    return {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/csv,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Connection": "keep-alive",
-        "Referer": "https://www.nseindia.com/all-reports-derivatives",
-    }
-
-
-def download_nse_fo_bhavcopy(trade_date: object) -> pd.DataFrame:
-    started = time.perf_counter()
-    cache_dir = DATA_DIR / "nse_fo_bhavcopy"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = cache_dir / nse_bhavcopy_filename(trade_date)
-    if cache_path.exists():
-        data = cache_path.read_bytes()
-        log_event("nse.bhavcopy.cache.hit", trade_date=str(trade_date), cache_path=str(cache_path), bytes=len(data))
-    else:
-        url = nse_bhavcopy_url(trade_date)
-        headers = nse_request_headers()
-        cookie_jar = http.cookiejar.CookieJar()
-        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
-        try:
-            warmup = urllib.request.Request("https://www.nseindia.com/all-reports-derivatives", headers=headers)
-            opener.open(warmup, timeout=10).read(1024)
-        except Exception:
-            pass
-        request = urllib.request.Request(url, headers=headers)
-        log_event("nse.bhavcopy.download.start", trade_date=str(trade_date), url=url)
-        with opener.open(request, timeout=30) as response:
-            data = response.read()
-        cache_path.write_bytes(data)
-        log_event(
-            "nse.bhavcopy.download.success",
-            trade_date=str(trade_date),
-            cache_path=str(cache_path),
-            bytes=len(data),
-            duration_ms=int((time.perf_counter() - started) * 1000),
-        )
-    with zipfile.ZipFile(io.BytesIO(data)) as archive:
-        csv_name = next((name for name in archive.namelist() if name.lower().endswith(".csv")), archive.namelist()[0])
-        with archive.open(csv_name) as handle:
-            return pd.read_csv(handle)
-
-
-def normalized_column_name(name: object) -> str:
-    return re.sub(r"[^a-z0-9]", "", str(name).lower())
-
-
-def find_bhavcopy_column(frame: pd.DataFrame, candidates: list[str]) -> str:
-    normalized = {normalized_column_name(column): column for column in frame.columns}
-    for candidate in candidates:
-        column = normalized.get(normalized_column_name(candidate))
-        if column is not None:
-            return column
-    raise ValueError(f"NSE bhavcopy column not found. Tried: {', '.join(candidates)}")
-
-
-def kite_option_contract_map() -> dict[tuple[str, object, float, str], object]:
-    instruments = load_kite_instruments()
-    allowed_underlyings = oi_baseline_underlyings()
-    options = instruments[
-        (instruments["exchange"].astype(str).str.upper() == "NFO")
-        & (instruments["name"].astype(str).str.upper().isin(allowed_underlyings))
-        & (instruments["instrument_type"].astype(str).str.upper().isin(["CE", "PE"]))
-    ].copy()
-    if options.empty:
-        return {}
-    options["expiry"] = pd.to_datetime(options["expiry"], errors="coerce").dt.date
-    options["strike"] = pd.to_numeric(options["strike"], errors="coerce")
-    result = {}
-    for row in options.itertuples():
-        if pd.isna(row.strike) or pd.isna(row.expiry):
-            continue
-        key = (str(row.name).upper(), row.expiry, round(float(row.strike), 4), str(row.instrument_type).upper())
-        result[key] = row
-    return result
-
-
-def nse_bhavcopy_to_oi_rows(frame: pd.DataFrame, trade_date: object) -> list[dict]:
-    allowed_underlyings = oi_baseline_underlyings()
-    symbol_col = find_bhavcopy_column(frame, ["SYMBOL", "TckrSymb", "TICKER_SYMBOL"])
-    expiry_col = find_bhavcopy_column(frame, ["EXPIRY_DT", "XpryDt", "EXPIRY_DATE"])
-    strike_col = find_bhavcopy_column(frame, ["STRIKE_PR", "StrkPric", "STRIKE_PRICE"])
-    option_type_col = find_bhavcopy_column(frame, ["OPTION_TYP", "OptnTp", "OPTION_TYPE"])
-    oi_col = find_bhavcopy_column(frame, ["OPEN_INT", "OpnIntrst", "OPEN_INTEREST"])
-    close_col = None
-    try:
-        close_col = find_bhavcopy_column(frame, ["CLOSE", "ClsPric", "LAST", "LastPric", "SttlmPric"])
-    except ValueError:
-        pass
-
-    contracts = kite_option_contract_map()
-    rows: list[dict] = []
-    for item in frame.itertuples(index=False):
-        record = dict(zip(frame.columns, item))
-        underlying = option_underlying_symbol(str(record[symbol_col]).upper().strip())
-        option_type = str(record[option_type_col]).upper().strip()
-        if underlying not in allowed_underlyings or option_type not in {"CE", "PE"}:
-            continue
-        expiry = pd.to_datetime(record[expiry_col], errors="coerce")
-        strike = pd.to_numeric(record[strike_col], errors="coerce")
-        oi = pd.to_numeric(record[oi_col], errors="coerce")
-        if pd.isna(expiry) or pd.isna(strike) or pd.isna(oi):
-            continue
-        key = (underlying, expiry.date(), round(float(strike), 4), option_type)
-        contract = contracts.get(key)
-        if contract is None:
-            continue
-        last_price = None
-        if close_col:
-            close_value = pd.to_numeric(record[close_col], errors="coerce")
-            if not pd.isna(close_value):
-                last_price = float(close_value)
-        rows.append(
-            {
-                "trade_date": trade_date,
-                "underlying": underlying,
-                "tradingsymbol": str(contract.tradingsymbol),
-                "expiry": expiry.date(),
-                "strike": float(strike),
-                "option_type": option_type,
-                "oi": int(oi),
-                "last_price": last_price,
-                "source": "nse.bhavcopy",
-            }
-        )
-    return rows
-
-
 def save_option_oi_rows(rows: list[dict], trade_date: object, started: float) -> int:
+    source = str(rows[0].get("source", "kite.quote.opening")) if rows else "kite.quote.opening"
     if not rows:
-        log_event("option_oi_baseline.capture.empty", "warning", trade_date=str(trade_date), source="nse.bhavcopy")
+        log_event("option_oi_baseline.capture.empty", "warning", trade_date=str(trade_date), source=source)
         return 0
 
     with db_connect() as conn:
@@ -1251,7 +1145,7 @@ def save_option_oi_rows(rows: list[dict], trade_date: object, started: float) ->
     log_event(
         "option_oi_baseline.capture.success",
         trade_date=str(trade_date),
-        source="nse.bhavcopy",
+        source=source,
         rows=len(rows),
         underlyings=len({row["underlying"] for row in rows}),
         duration_ms=int((time.perf_counter() - started) * 1000),
@@ -1259,17 +1153,56 @@ def save_option_oi_rows(rows: list[dict], trade_date: object, started: float) ->
     return len(rows)
 
 
-def save_option_oi_daily_baseline(trade_date: object) -> int:
+def kite_option_oi_rows(trade_date: object) -> list[dict]:
+    instruments = load_kite_instruments()
+    allowed_underlyings = oi_baseline_underlyings()
+    today = pd.to_datetime(trade_date).date()
+    options = instruments[
+        (instruments["exchange"].astype(str).str.upper() == "NFO")
+        & (instruments["name"].astype(str).str.upper().isin(allowed_underlyings))
+        & (instruments["instrument_type"].astype(str).str.upper().isin(["CE", "PE"]))
+    ].copy()
+    if options.empty:
+        return []
+
+    options["expiry"] = pd.to_datetime(options["expiry"], errors="coerce").dt.date
+    options["strike"] = pd.to_numeric(options["strike"], errors="coerce")
+    options = options[(options["expiry"].notna()) & (options["expiry"] >= today) & (options["strike"].notna())]
+    keys = [f"NFO:{row.tradingsymbol}" for row in options.itertuples()]
+    quotes = kite_quote_snapshot(keys)
+
+    rows: list[dict] = []
+    for row in options.itertuples():
+        quote = quotes.get(f"NFO:{row.tradingsymbol}", {})
+        oi = pd.to_numeric(quote.get("oi"), errors="coerce")
+        if pd.isna(oi):
+            continue
+        last_price = pd.to_numeric(quote.get("last_price"), errors="coerce")
+        rows.append(
+            {
+                "trade_date": trade_date,
+                "underlying": option_underlying_symbol(str(row.name)),
+                "tradingsymbol": str(row.tradingsymbol),
+                "expiry": row.expiry,
+                "strike": float(row.strike),
+                "option_type": str(row.instrument_type).upper(),
+                "oi": int(oi),
+                "last_price": None if pd.isna(last_price) else float(last_price),
+                "source": "kite.quote.opening",
+            }
+        )
+    return rows
+
+
+def save_kite_option_oi_baseline(trade_date: object) -> int:
     if not ensure_events_table():
         return 0
     started = time.perf_counter()
-    frame = download_nse_fo_bhavcopy(trade_date)
-    rows = nse_bhavcopy_to_oi_rows(frame, trade_date)
+    rows = kite_option_oi_rows(trade_date)
     log_event(
         "option_oi_baseline.capture.start",
         trade_date=str(trade_date),
-        source="nse.bhavcopy",
-        bhavcopy_rows=len(frame),
+        source="kite.quote.opening",
         rows=len(rows),
         underlyings=len({row["underlying"] for row in rows}),
     )
@@ -1277,23 +1210,11 @@ def save_option_oi_daily_baseline(trade_date: object) -> int:
 
 
 def save_latest_option_oi_baseline(max_trade_date: object | None = None) -> int:
-    max_date = pd.to_datetime(max_trade_date or datetime.now().date()).date()
-    for offset in range(nse_bhavcopy_lookback_days()):
-        trade_date = max_date - timedelta(days=offset)
-        if option_oi_baseline_exists(trade_date):
-            log_event("option_oi_baseline.skip", trade_date=str(trade_date), reason="already_exists")
-            return 0
-        try:
-            return save_option_oi_daily_baseline(trade_date)
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                log_event("nse.bhavcopy.missing", "warning", trade_date=str(trade_date), status=exc.code)
-                continue
-            log_event("nse.bhavcopy.error", "error", trade_date=str(trade_date), status=exc.code, error=str(exc))
-        except (urllib.error.URLError, TimeoutError, zipfile.BadZipFile, ValueError) as exc:
-            log_event("nse.bhavcopy.error", "warning", trade_date=str(trade_date), error=str(exc))
-    log_event("option_oi_baseline.skip", "warning", reason="no_nse_bhavcopy_found", lookback_days=nse_bhavcopy_lookback_days())
-    return 0
+    trade_date = pd.to_datetime(max_trade_date or datetime.now().date()).date()
+    if option_oi_baseline_exists(trade_date):
+        log_event("option_oi_baseline.skip", trade_date=str(trade_date), reason="already_exists", source="kite.quote.opening")
+        return 0
+    return save_kite_option_oi_baseline(trade_date)
 
 
 def oi_baseline_due_now() -> bool:
@@ -1308,7 +1229,7 @@ def oi_baseline_scheduler_loop() -> None:
     log_event(
         "option_oi_baseline.scheduler.start",
         enabled=oi_baseline_enabled(),
-        source="nse.bhavcopy",
+        source="kite.quote.opening",
         capture_time="%02d:%02d" % oi_baseline_capture_time(),
         poll_seconds=oi_baseline_poll_seconds(),
         underlyings=len(oi_baseline_underlyings()),
@@ -1514,10 +1435,8 @@ def fetch_tradingview_recommendation(symbol: str, interval: str) -> dict:
 
 def tradingview_interval(interval: str) -> str:
     attr = {
-        "1m": "INTERVAL_1_MINUTE",
         "5m": "INTERVAL_5_MINUTES",
         "15m": "INTERVAL_15_MINUTES",
-        "30m": "INTERVAL_30_MINUTES",
     }[interval]
     return getattr(TVInterval, attr)
 
@@ -1692,7 +1611,7 @@ class RatingsHandler(BaseHTTPRequestHandler):
         started = time.perf_counter()
         params = urllib.parse.parse_qs(query)
         symbol = params.get("symbol", [DEFAULT_SYMBOL])[0]
-        interval = params.get("interval", ["30m"])[0]
+        interval = params.get("interval", ["5m"])[0]
         range_ = params.get("range", ["2y"])[0]
         csv_path = params.get("csv", [""])[0].strip()
         log_event("ratings.request.start", symbol=symbol, interval=interval, range=range_, csv=bool(csv_path))
@@ -1797,8 +1716,7 @@ class RatingsHandler(BaseHTTPRequestHandler):
             "database_ready": DB_READY,
             "oi_baseline_enabled": oi_baseline_enabled(),
             "oi_baseline_capture_time": "%02d:%02d" % oi_baseline_capture_time(),
-            "oi_baseline_source": "nse.bhavcopy",
-            "nse_bhavcopy_lookback_days": nse_bhavcopy_lookback_days(),
+            "oi_baseline_source": "kite.quote.opening",
             "oi_baseline_thread_started": OI_BASELINE_THREAD_STARTED,
         }
         log_event("health.success", **payload)
@@ -2971,6 +2889,89 @@ INDEX_HTML = r"""<!doctype html>
       font-variant-numeric: tabular-nums;
       white-space: nowrap;
     }
+    .option-table tfoot td {
+      background: #f9ca50;
+      color: #111827;
+      border-color: var(--grid);
+      font-size: 14px;
+      font-weight: 950;
+    }
+    .option-table tfoot td.total-label {
+      text-align: right;
+      text-transform: uppercase;
+    }
+    .option-table tfoot td.total-oi {
+      background: #f0b72d;
+    }
+    .option-table tfoot td.total-change.positive {
+      background: #20b52b;
+      color: #071b08;
+    }
+    .option-table tfoot td.total-change.negative {
+      background: #ff3b18;
+      color: #1f0801;
+    }
+    .option-table tfoot td.total-change.flat {
+      background: #f9ca50;
+      color: #111827;
+    }
+    .intraday-panel {
+      margin: 0 0 22px;
+      border: 3px solid #119b45;
+      background: #fff;
+      overflow: hidden;
+    }
+    .intraday-panel h3 {
+      margin: 0;
+      padding: 8px 10px;
+      background: #099648;
+      color: #fff;
+      text-align: center;
+      font-size: 16px;
+      font-weight: 950;
+      line-height: 1.15;
+    }
+    .intraday-scroll { overflow-x: auto; }
+    .intraday-table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }
+    .intraday-table th {
+      padding: 8px 6px;
+      border: 2px solid #8bd09e;
+      background: #09a74d;
+      color: #fff;
+      text-align: center;
+      font-size: 13px;
+      font-weight: 950;
+      text-transform: uppercase;
+      line-height: 1.1;
+    }
+    .intraday-table td {
+      padding: 7px 6px;
+      border: 2px solid #8bd09e;
+      text-align: center;
+      font-size: 14px;
+      font-weight: 900;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .intraday-table .metric-positive,
+    .intraday-table .signal-buy {
+      background: #20b52b;
+      color: #061b08;
+    }
+    .intraday-table .metric-negative,
+    .intraday-table .signal-sell {
+      background: #ff3b18;
+      color: #1f0801;
+    }
+    .intraday-table .metric-flat,
+    .intraday-table .signal-neutral {
+      background: #f8fafc;
+      color: #111827;
+    }
     .option-table .strike-cell {
       background: #f8fff9;
       color: #111827;
@@ -3031,10 +3032,8 @@ INDEX_HTML = r"""<!doctype html>
         <span class="app-logo-text">Stock<span>Radar</span></span>
       </a>
       <nav class="timeframes" aria-label="Timeframes">
-        <button class="tf" type="button" data-interval="1m">1 minute</button>
-        <button class="tf" type="button" data-interval="5m">5 minutes</button>
+        <button class="tf active" type="button" data-interval="5m">5 minutes</button>
         <button class="tf" type="button" data-interval="15m">15 minutes</button>
-        <button class="tf active" type="button" data-interval="30m">30 minutes</button>
       </nav>
     </div>
     <form class="symbol-form" id="controls">
@@ -3119,6 +3118,29 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </div>
     <p class="chain-summary" id="chainMeta">Waiting for option chain</p>
+    <section class="intraday-panel">
+      <h3>Intraday Data (Use This Indicator Only After 10:30AM)</h3>
+      <div class="intraday-scroll">
+        <table class="intraday-table">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Strike</th>
+              <th>Call</th>
+              <th>Put</th>
+              <th>Diff</th>
+              <th>PCR</th>
+              <th>Option Signal</th>
+              <th>VWAP</th>
+              <th>Price</th>
+            </tr>
+          </thead>
+          <tbody id="intradayRows">
+            <tr><td colspan="9">Waiting for option chain data</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
     <div class="chain-grid">
       <section class="option-board call">
         <h3 id="callTitle">Call Option</h3>
@@ -3134,6 +3156,7 @@ INDEX_HTML = r"""<!doctype html>
               </tr>
             </thead>
             <tbody id="callRows"></tbody>
+            <tfoot id="callTotals"></tfoot>
           </table>
         </div>
       </section>
@@ -3151,6 +3174,7 @@ INDEX_HTML = r"""<!doctype html>
               </tr>
             </thead>
             <tbody id="putRows"></tbody>
+            <tfoot id="putTotals"></tfoot>
           </table>
         </div>
       </section>
@@ -3168,7 +3192,7 @@ const expirySelect = document.getElementById("expirySelect");
 const symbolInput = document.getElementById("symbol");
 const symbolSuggestions = document.getElementById("symbolSuggestions");
 const autoRefreshSelect = document.getElementById("autoRefresh");
-let activeInterval = "30m";
+let activeInterval = "5m";
 let activeView = "ratings";
 let symbolTimer = 0;
 let autoRefreshTimer = 0;
@@ -3457,9 +3481,102 @@ function oiClass(value) {
   return Number(value) > 0 ? "positive" : "negative";
 }
 
+function metricClass(value) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value)) || Number(value) === 0) return "metric-flat";
+  return Number(value) > 0 ? "metric-positive" : "metric-negative";
+}
+
 function percent(value) {
   if (value === null || value === undefined || !Number.isFinite(Number(value))) return "-";
   return `${Math.round(Number(value))} %`;
+}
+
+function optionTotals(rows, sideKey) {
+  return rows.reduce((acc, row) => {
+    const side = row[sideKey] || {};
+    const oi = Number(opt(side, "oi"));
+    const change = oiChange(side);
+    if (Number.isFinite(oi)) acc.oi += oi;
+    if (change !== null && Number.isFinite(change)) acc.change += change;
+    return acc;
+  }, { oi: 0, change: 0 });
+}
+
+function totalPercent(total) {
+  const previous = total.oi - total.change;
+  if (!Number.isFinite(previous) || previous <= 0) return null;
+  return (total.change / previous) * 100;
+}
+
+function normalizedTotal(data, rows, sideKey) {
+  const total = data.totals && data.totals[sideKey] ? data.totals[sideKey] : optionTotals(rows, sideKey);
+  return {
+    oi: Number(total.oi || 0),
+    change: Number(total.oi_change ?? total.change ?? 0)
+  };
+}
+
+function renderOptionTotals(targetId, data, sideKey) {
+  const total = normalizedTotal(data, data.rows || [], sideKey);
+  document.getElementById(targetId).innerHTML = `<tr>
+    <td class="total-label" colspan="2">Total</td>
+    <td class="total-oi">${integer(total.oi)}</td>
+    <td class="total-change ${oiClass(total.change)}">${integer(total.change)}</td>
+    <td>${percent(totalPercent(total))}</td>
+  </tr>`;
+}
+
+function intradayTimeLabel(timestamp) {
+  const date = timestamp ? new Date(timestamp) : new Date();
+  if (Number.isNaN(date.getTime())) return "--";
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  return `${hours}${minutes}`;
+}
+
+function pcrValue(row) {
+  const callOi = Number(opt(row.CE || {}, "oi"));
+  const putOi = Number(opt(row.PE || {}, "oi"));
+  if (!Number.isFinite(callOi) || callOi <= 0 || !Number.isFinite(putOi)) return null;
+  return putOi / callOi;
+}
+
+function optionSignal(diff, pcr) {
+  if (diff > 0 && pcr !== null && pcr >= 1.05) return "BUY";
+  if (diff < 0 && pcr !== null && pcr <= 0.95) return "SELL";
+  return "NEUTRAL";
+}
+
+function signalClass(signal) {
+  if (signal === "BUY") return "signal-buy";
+  if (signal === "SELL") return "signal-sell";
+  return "signal-neutral";
+}
+
+function renderIntradayRows(data) {
+  const host = document.getElementById("intradayRows");
+  try {
+    const vwap = data.vwap ?? data.spot;
+    const timeLabel = intradayTimeLabel(data.timestamp);
+    const callTotal = normalizedTotal(data, data.rows || [], "CE");
+    const putTotal = normalizedTotal(data, data.rows || [], "PE");
+    const diff = putTotal.change - callTotal.change;
+    const pcr = callTotal.oi > 0 ? putTotal.oi / callTotal.oi : null;
+    const signal = optionSignal(diff, pcr);
+    host.innerHTML = `<tr>
+      <td>${timeLabel}</td>
+      <td>All</td>
+      <td class="${metricClass(callTotal.change)}">${integer(callTotal.change)}</td>
+      <td class="${metricClass(putTotal.change)}">${integer(putTotal.change)}</td>
+      <td class="${metricClass(diff)}">${integer(diff)}</td>
+      <td>${pcr === null ? "--" : pcr.toFixed(2)}</td>
+      <td class="${signalClass(signal)}">${signal}</td>
+      <td>${money(vwap)}</td>
+      <td>${money(data.spot)}</td>
+    </tr>`;
+  } catch (error) {
+    host.innerHTML = `<tr><td colspan="9">Intraday data unavailable</td></tr>`;
+  }
 }
 
 function optionRows(rows, sideKey, atmStrike) {
@@ -3494,6 +3611,9 @@ function renderOptionChain(data) {
   }, null);
   document.getElementById("callRows").innerHTML = optionRows(data.rows, "CE", atmStrike);
   document.getElementById("putRows").innerHTML = optionRows(data.rows, "PE", atmStrike);
+  renderOptionTotals("callTotals", data, "CE");
+  renderOptionTotals("putTotals", data, "PE");
+  renderIntradayRows(data);
 }
 
 async function loadOptionChain() {
@@ -3713,8 +3833,7 @@ def run_server(host: str, port: int) -> None:
         database_enabled=database_enabled(),
         oi_baseline_enabled=oi_baseline_enabled(),
         oi_baseline_capture_time="%02d:%02d" % oi_baseline_capture_time(),
-        oi_baseline_source="nse.bhavcopy",
-        nse_bhavcopy_lookback_days=nse_bhavcopy_lookback_days(),
+        oi_baseline_source="kite.quote.opening",
     )
     print(f"Technical Ratings app running at http://{host}:{port}")
     if LOG_FILE_PATH:
@@ -3743,7 +3862,7 @@ def run_cli(symbol: str, csv_path: str | None, interval: str, range_: str) -> No
 def main() -> None:
     parser = argparse.ArgumentParser(description="TradingView-style Technical Ratings gauge")
     parser.add_argument("--symbol", default=DEFAULT_SYMBOL)
-    parser.add_argument("--interval", default="30m")
+    parser.add_argument("--interval", default="5m")
     parser.add_argument("--range", default="2y")
     parser.add_argument("--csv", default=None, help="CSV path with Open, High, Low, Close, Volume columns")
     parser.add_argument("--cli", action="store_true", help="Print JSON instead of starting the web app")
