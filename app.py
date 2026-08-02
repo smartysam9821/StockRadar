@@ -1934,36 +1934,130 @@ LOGIN_HTML = r"""<!doctype html>
       color: #fff;
       overflow: hidden;
     }
-    .logo {
+    .sr-logo {
       display: inline-flex;
       align-items: center;
-      gap: 12px;
-      font-size: 22px;
+      gap: 10px;
+    }
+    .sr-logo-mark {
+      width: 44px;
+      height: 44px;
+      border-radius: 11px;
+      background: linear-gradient(135deg, #3b6fef, #7c4def);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      box-shadow: 0 16px 28px rgba(80, 104, 255, .28);
+    }
+    .sr-logo-mark svg {
+      width: 23px;
+      height: 23px;
+    }
+    .sr-logo-text {
       font-weight: 900;
+      font-size: 24px;
+      color: #f4f6fb;
       letter-spacing: 0;
     }
-    .logo-mark {
-      width: 39px;
-      height: 39px;
+    .sr-logo-text span { color: #12b6ac; }
+    .sr-radar-wrap {
       display: grid;
       place-items: center;
-      border-radius: 10px;
-      background: linear-gradient(135deg, #5068ff, #7451ef);
-      box-shadow: 0 14px 26px rgba(80, 104, 255, .28);
+      gap: 10px;
+      margin: 10px 0 8px;
     }
-    .logo-mark svg { width: 22px; height: 22px; }
-    .logo span span { color: var(--teal); }
-    .scanner {
-      align-self: center;
-      width: min(380px, 86%);
-      margin: 8px 0 4px;
-      opacity: .98;
+    .sr-radar-title {
+      color: #7181ad;
+      font-size: 12px;
+      font-weight: 900;
+      letter-spacing: 6px;
+      text-transform: uppercase;
     }
-    .scanner text {
-      fill: #7181ad;
-      font-size: 11px;
-      font-weight: 800;
-      letter-spacing: 4px;
+    .sr-radar {
+      position: relative;
+      width: min(350px, 86%);
+      aspect-ratio: 1;
+      overflow: hidden;
+      border-radius: 50%;
+    }
+    .sr-ring {
+      position: absolute;
+      border-radius: 50%;
+      border: 1px solid #1e2740;
+    }
+    .sr-ring.r1 { inset: 0; }
+    .sr-ring.r2 { inset: 16%; }
+    .sr-ring.r3 { inset: 32%; }
+    .sr-ring.r4 { inset: 48%; }
+    .sr-cross {
+      position: absolute;
+      inset: 0;
+    }
+    .sr-cross::before,
+    .sr-cross::after {
+      content: "";
+      position: absolute;
+      background: #1e2740;
+    }
+    .sr-cross::before {
+      left: 0;
+      right: 0;
+      top: 50%;
+      height: 1px;
+    }
+    .sr-cross::after {
+      top: 0;
+      bottom: 0;
+      left: 50%;
+      width: 1px;
+    }
+    .sr-sweep {
+      position: absolute;
+      inset: 0;
+      border-radius: 50%;
+      background: conic-gradient(
+        from 0deg,
+        rgba(18, 182, 172, .55) 0deg,
+        rgba(18, 182, 172, .16) 26deg,
+        rgba(18, 182, 172, 0) 60deg,
+        rgba(18, 182, 172, 0) 360deg
+      );
+      animation: sr-spin 4.5s linear infinite;
+    }
+    @keyframes sr-spin { to { transform: rotate(360deg); } }
+    .sr-blip {
+      position: absolute;
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      transform: translate(-50%, -50%);
+    }
+    .sr-blip::after {
+      content: "";
+      position: absolute;
+      inset: -7px;
+      border-radius: 50%;
+      border: 2px solid currentColor;
+      opacity: .78;
+    }
+    .sr-blip.buy {
+      background: #12b6ac;
+      color: #12b6ac;
+    }
+    .sr-blip.sell {
+      background: #e5484d;
+      color: #e5484d;
+    }
+    .sr-center {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #f4f6fb;
+      transform: translate(-50%, -50%);
     }
     .hero-copy h1 {
       max-width: 420px;
@@ -2005,22 +2099,40 @@ LOGIN_HTML = r"""<!doctype html>
       background: var(--teal);
       box-shadow: 0 0 14px rgba(18, 200, 193, .8);
     }
-    .ticker {
-      height: 54px;
+    .sr-ticker {
+      width: 100%;
+      overflow: hidden;
+      margin-top: 28px;
+      border-top: 1px solid rgba(136, 156, 211, .25);
+      border-bottom: 1px solid rgba(136, 156, 211, .12);
+      padding: 14px 0;
+    }
+    .sr-ticker-track {
+      display: flex;
+      gap: 28px;
+      width: max-content;
+      animation: sr-scroll 22s linear infinite;
+    }
+    @keyframes sr-scroll {
+      from { transform: translateX(0); }
+      to { transform: translateX(-50%); }
+    }
+    .sr-tick {
       display: flex;
       align-items: center;
-      gap: 28px;
-      margin-top: 28px;
-      padding-top: 18px;
-      border-top: 1px solid rgba(136, 156, 211, .25);
-      color: #9aa7c3;
-      font-size: 13px;
-      font-weight: 900;
+      gap: 8px;
       white-space: nowrap;
-      overflow: hidden;
+      color: #93a0be;
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+      font-weight: 800;
     }
-    .ticker strong { color: #f4f7ff; }
-    .ticker .up { color: #19c37d; }
+    .sr-tick b {
+      color: #f4f6fb;
+      font-weight: 800;
+    }
+    .sr-tick .up { color: #1ba672; }
+    .sr-tick .down { color: #e5484d; }
     .panel {
       padding: clamp(48px, 6vw, 64px);
       display: flex;
@@ -2182,7 +2294,7 @@ LOGIN_HTML = r"""<!doctype html>
       .shell { grid-template-columns: 1fr; }
       .brand { min-height: 560px; padding: 34px; }
       .panel { padding: 38px 34px; }
-      .scanner { width: min(340px, 92%); }
+      .sr-radar { width: min(320px, 92%); }
     }
     @media (max-width: 520px) {
       body { padding: 14px; }
@@ -2196,39 +2308,32 @@ LOGIN_HTML = r"""<!doctype html>
 <body>
   <main class="shell">
     <section class="brand">
-      <div class="logo">
-        <span class="logo-mark">
+      <div class="sr-logo">
+        <span class="sr-logo-mark">
           <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-            <path d="M5 16l4-4 3 3 7-8" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-            <path d="M15 7h4v4" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M3 17 L9 10 L13 14 L21 5" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M15 5 H21 V11" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
           </svg>
         </span>
-        <span>Stock<span>Radar</span></span>
+        <span class="sr-logo-text">Stock<span>Radar</span></span>
       </div>
-      <svg class="scanner" viewBox="0 0 360 330" role="img" aria-label="Market scanner">
-        <defs>
-          <radialGradient id="scanGlow" cx="38%" cy="48%" r="58%">
-            <stop offset="0%" stop-color="#19d3ca" stop-opacity=".55"/>
-            <stop offset="58%" stop-color="#19d3ca" stop-opacity=".12"/>
-            <stop offset="100%" stop-color="#19d3ca" stop-opacity="0"/>
-          </radialGradient>
-        </defs>
-        <text x="180" y="24" text-anchor="middle">SCANNING MARKET</text>
-        <circle cx="180" cy="168" r="150" fill="none" stroke="#24304d"/>
-        <circle cx="180" cy="168" r="108" fill="none" stroke="#24304d"/>
-        <circle cx="180" cy="168" r="67" fill="none" stroke="#24304d"/>
-        <circle cx="180" cy="168" r="32" fill="none" stroke="#24304d"/>
-        <path d="M30 168a150 150 0 0 1 150-150v150z" fill="url(#scanGlow)"/>
-        <path d="M30 168h300M180 18v300" stroke="#263250"/>
-        <circle cx="180" cy="168" r="3.5" fill="#edf4ff"/>
-        <g fill="none" stroke-width="2.2">
-          <circle cx="142" cy="76" r="9" stroke="#ef4456"/><circle cx="142" cy="76" r="3" fill="#ef4456" stroke="none"/>
-          <circle cx="252" cy="96" r="9" stroke="#12c8a8"/><circle cx="252" cy="96" r="3" fill="#12c8a8" stroke="none"/>
-          <circle cx="307" cy="148" r="9" stroke="#12c8a8"/><circle cx="307" cy="148" r="3" fill="#12c8a8" stroke="none"/>
-          <circle cx="240" cy="252" r="9" stroke="#12c8a8"/><circle cx="240" cy="252" r="3" fill="#12c8a8" stroke="none"/>
-          <circle cx="130" cy="222" r="9" stroke="#ef4456"/><circle cx="130" cy="222" r="3" fill="#ef4456" stroke="none"/>
-        </g>
-      </svg>
+      <div class="sr-radar-wrap">
+        <div class="sr-radar-title">Scanning Market</div>
+        <div class="sr-radar" role="img" aria-label="Animated market scanner">
+          <div class="sr-ring r1"></div>
+          <div class="sr-ring r2"></div>
+          <div class="sr-ring r3"></div>
+          <div class="sr-ring r4"></div>
+          <div class="sr-cross"></div>
+          <div class="sr-sweep"></div>
+          <div class="sr-blip buy" style="top:28%;left:62%;"></div>
+          <div class="sr-blip sell" style="top:68%;left:34%;"></div>
+          <div class="sr-blip buy" style="top:44%;left:80%;"></div>
+          <div class="sr-blip sell" style="top:20%;left:38%;"></div>
+          <div class="sr-blip buy" style="top:78%;left:58%;"></div>
+          <div class="sr-center"></div>
+        </div>
+      </div>
       <div class="hero-copy">
         <h1>Every signal, every strike, one dashboard.</h1>
         <p>Live oscillator and moving-average ratings, full option chains, and Kite-linked market data behind one private session.</p>
@@ -2238,10 +2343,19 @@ LOGIN_HTML = r"""<!doctype html>
           <span class="chip">Option chain</span>
         </div>
       </div>
-      <div class="ticker">
-        <span>RELIANCE <strong>2,912.40</strong> <span class="up">Buy</span></span>
-        <span>TCS <strong>4,105.10</strong> <span class="up">Buy</span></span>
-        <span>HDFCBANK <strong>1,688.75</strong></span>
+      <div class="sr-ticker" aria-label="Moving stock price strip">
+        <div class="sr-ticker-track">
+          <div class="sr-tick">ASIANPAINT <b>2,738.00</b> <span class="down">v Sell</span></div>
+          <div class="sr-tick">RELIANCE <b>2,912.40</b> <span class="up">^ Buy</span></div>
+          <div class="sr-tick">TCS <b>4,105.10</b> <span class="up">^ Buy</span></div>
+          <div class="sr-tick">HDFCBANK <b>1,678.55</b> <span class="down">v Sell</span></div>
+          <div class="sr-tick">INFY <b>1,842.20</b> <span class="up">^ Buy</span></div>
+          <div class="sr-tick">ASIANPAINT <b>2,738.00</b> <span class="down">v Sell</span></div>
+          <div class="sr-tick">RELIANCE <b>2,912.40</b> <span class="up">^ Buy</span></div>
+          <div class="sr-tick">TCS <b>4,105.10</b> <span class="up">^ Buy</span></div>
+          <div class="sr-tick">HDFCBANK <b>1,678.55</b> <span class="down">v Sell</span></div>
+          <div class="sr-tick">INFY <b>1,842.20</b> <span class="up">^ Buy</span></div>
+        </div>
       </div>
     </section>
     <section class="panel">
