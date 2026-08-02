@@ -1901,7 +1901,8 @@ LOGIN_HTML = r"""<!doctype html>
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      min-height: 100vh;
+      height: 100vh;
+      height: 100svh;
       display: grid;
       place-items: center;
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Arial, sans-serif;
@@ -1910,13 +1911,16 @@ LOGIN_HTML = r"""<!doctype html>
         radial-gradient(circle at 25% 8%, rgba(64, 114, 242, .12), transparent 32%),
         radial-gradient(circle at 80% 78%, rgba(18, 200, 193, .10), transparent 30%),
         var(--page);
-      padding: 24px;
+      padding: 16px;
+      overflow: hidden;
     }
     .shell {
       width: min(900px, 100%);
+      height: min(550px, calc(100vh - 32px));
+      height: min(550px, calc(100svh - 32px));
       display: grid;
       grid-template-columns: 1fr 1fr;
-      min-height: 550px;
+      min-height: 0;
       border-radius: 22px;
       background: #fff;
       box-shadow: 0 34px 90px rgba(28, 39, 69, .18);
@@ -1924,7 +1928,7 @@ LOGIN_HTML = r"""<!doctype html>
     }
     .brand {
       position: relative;
-      padding: 38px 38px 30px;
+      padding: 30px 34px 24px;
       display: flex;
       flex-direction: column;
       justify-content: space-between;
@@ -1965,7 +1969,7 @@ LOGIN_HTML = r"""<!doctype html>
       display: grid;
       place-items: center;
       gap: 10px;
-      margin: 10px 0 8px;
+      margin: 6px 0 4px;
     }
     .sr-radar-title {
       color: #7181ad;
@@ -1976,7 +1980,7 @@ LOGIN_HTML = r"""<!doctype html>
     }
     .sr-radar {
       position: relative;
-      width: min(305px, 82%);
+      width: min(275px, 80%);
       aspect-ratio: 1;
       overflow: hidden;
       border-radius: 50%;
@@ -2061,8 +2065,8 @@ LOGIN_HTML = r"""<!doctype html>
     }
     .hero-copy h1 {
       max-width: 420px;
-      margin: 0 0 12px;
-      font-size: 26px;
+      margin: 0 0 10px;
+      font-size: 24px;
       line-height: 1.28;
       letter-spacing: 0;
     }
@@ -2070,14 +2074,14 @@ LOGIN_HTML = r"""<!doctype html>
       max-width: 420px;
       margin: 0;
       color: #aeb8d2;
-      font-size: 16px;
-      line-height: 1.55;
+      font-size: 15px;
+      line-height: 1.48;
     }
     .chips {
       display: flex;
       flex-wrap: wrap;
       gap: 10px;
-      margin-top: 24px;
+      margin-top: 18px;
     }
     .chip {
       display: inline-flex;
@@ -2102,10 +2106,10 @@ LOGIN_HTML = r"""<!doctype html>
     .sr-ticker {
       width: 100%;
       overflow: hidden;
-      margin-top: 28px;
+      margin-top: 20px;
       border-top: 1px solid rgba(136, 156, 211, .25);
       border-bottom: 1px solid rgba(136, 156, 211, .12);
-      padding: 14px 0;
+      padding: 12px 0;
     }
     .sr-ticker-track {
       display: flex;
@@ -2134,7 +2138,7 @@ LOGIN_HTML = r"""<!doctype html>
     .sr-tick .up { color: #1ba672; }
     .sr-tick .down { color: #e5484d; }
     .panel {
-      padding: clamp(40px, 5vw, 54px);
+      padding: clamp(34px, 4.5vw, 48px);
       display: flex;
       flex-direction: column;
       justify-content: center;
@@ -2159,14 +2163,14 @@ LOGIN_HTML = r"""<!doctype html>
       letter-spacing: 0;
     }
     .panel .sub {
-      margin: 0 0 34px;
+      margin: 0 0 26px;
       color: var(--muted);
       line-height: 1.55;
       font-size: 16px;
     }
     label {
       display: block;
-      margin: 18px 0 8px;
+      margin: 14px 0 7px;
       color: #071126;
       font-weight: 800;
       font-size: 14px;
@@ -2238,7 +2242,7 @@ LOGIN_HTML = r"""<!doctype html>
     button {
       width: 100%;
       height: 54px;
-      margin-top: 34px;
+      margin-top: 26px;
       border: 0;
       border-radius: 10px;
       color: #fff;
@@ -2291,6 +2295,8 @@ LOGIN_HTML = r"""<!doctype html>
       font-weight: 800;
     }
     @media (max-width: 860px) {
+      body { height: auto; min-height: 100svh; overflow: auto; }
+      .shell { height: auto; }
       .shell { grid-template-columns: 1fr; }
       .brand { min-height: 560px; padding: 34px; }
       .panel { padding: 38px 34px; }
