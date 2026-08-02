@@ -67,7 +67,7 @@ KITE_INSTRUMENT_CACHE = DATA_DIR / "kite_instruments.csv"
 KITE_TOKEN_FILE = DATA_DIR / "kite_access_token.json"
 KITE_ACCESS_TOKEN_MEMORY = ""
 APP_SESSION_COOKIE = "stock_app_session"
-ALLOWED_INTERVALS = {"1m", "5m", "15m", "30m", "1h", "2h", "4h", "1d", "1wk", "1mo"}
+ALLOWED_INTERVALS = {"1m", "5m", "15m", "30m"}
 ALLOWED_RANGES = {"1d", "5d", "7d", "30d", "60d", "90d", "6mo", "1y", "2y", "5y", "10y", "max"}
 SYMBOL_RE = re.compile(r"^(?:[A-Z]{2,5}:)?[A-Z0-9&.\- ]{1,40}(?:\.NS)?$")
 INDEX_OPTION_UNDERLYING_ALIASES = {
@@ -148,10 +148,6 @@ TV_INTERVALS = {
     "5m": "5m",
     "15m": "15m",
     "30m": "30m",
-    "1h": "1h",
-    "2h": "2h",
-    "4h": "4h",
-    "1d": "1d",
 }
 
 
@@ -349,7 +345,7 @@ def verify_session_cookie(value: str) -> bool:
     return payload.get("u") == app_username() and 0 <= age <= 12 * 60 * 60
 
 
-def fetch_kite_ohlcv(symbol: str, interval: str = "1d", range_: str = "2y") -> pd.DataFrame:
+def fetch_kite_ohlcv(symbol: str, interval: str = "30m", range_: str = "2y") -> pd.DataFrame:
     started = time.perf_counter()
     symbol = validate_symbol(symbol)
     interval = validate_interval(interval)
@@ -378,10 +374,7 @@ def fetch_kite_ohlcv(symbol: str, interval: str = "1d", range_: str = "2y") -> p
             raise ValueError(f"No Kite candles returned for {exchange}:{tradingsymbol}.")
 
         df = pd.concat(chunks, ignore_index=True).drop_duplicates(subset=["Date"]).sort_values("Date")
-        if interval in {"2h", "4h", "1wk", "1mo"}:
-            df = resample_ohlcv(df, interval)
-        else:
-            df = df.reset_index(drop=True)
+        df = df.reset_index(drop=True)
         log_event(
             "kite.ohlcv.success",
             symbol=f"{exchange}:{tradingsymbol}",
@@ -504,12 +497,6 @@ def kite_source_interval(interval: str) -> str:
         "5m": "5minute",
         "15m": "15minute",
         "30m": "30minute",
-        "1h": "60minute",
-        "2h": "60minute",
-        "4h": "60minute",
-        "1d": "day",
-        "1wk": "day",
-        "1mo": "day",
     }
     if interval not in mapping:
         raise ValueError(f"Kite interval not supported: {interval}")
@@ -523,19 +510,8 @@ def kite_date_window(interval: str, requested_range: str) -> tuple[datetime, dat
         "5m": 30,
         "15m": 75,
         "30m": 120,
-        "1h": 365,
-        "2h": 730,
-        "4h": 1100,
-        "1d": 900,
-        "1wk": 2200,
-        "1mo": 7500,
     }
-    if interval in {"1m", "5m", "15m", "30m", "1h", "2h", "4h"}:
-        days = minimum_days.get(interval, 120)
-    elif requested_range == "max":
-        days = minimum_days.get(interval, 900)
-    else:
-        days = max(_range_rank(requested_range), minimum_days.get(interval, 900))
+    days = minimum_days.get(interval, 120)
     return to_dt - timedelta(days=days), to_dt
 
 
@@ -837,65 +813,6 @@ def load_kite_instruments() -> pd.DataFrame:
 
 def cache_age_seconds(path: Path) -> float:
     return time.time() - path.stat().st_mtime
-
-
-def resample_ohlcv(df: pd.DataFrame, interval: str) -> pd.DataFrame:
-    rule = {"2h": "2h", "4h": "4h", "1wk": "W-FRI", "1mo": "ME"}[interval]
-    data = df.set_index("Date").sort_index()
-    resampled = data.resample(rule).agg(
-        {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
-    )
-    return resampled.dropna().reset_index()
-
-
-def history_range_for_indicators(interval: str, requested_range: str) -> str:
-    """Fetch enough bars for 200-period indicators, independent of visible range."""
-    capped = {
-        "1m": "7d",
-        "2m": "60d",
-        "5m": "60d",
-        "15m": "60d",
-        "30m": "60d",
-        "60m": "730d",
-        "90m": "60d",
-        "1h": "730d",
-        "2h": "730d",
-        "4h": "730d",
-    }
-    if interval in capped:
-        return capped[interval]
-
-    minimums = {
-        "1d": "2y",
-        "5d": "5y",
-        "1wk": "10y",
-        "1mo": "max",
-        "3mo": "max",
-    }
-    requested_rank = _range_rank(requested_range)
-    minimum = minimums.get(interval, "2y")
-    return requested_range if requested_rank >= _range_rank(minimum) else minimum
-
-
-def _range_rank(range_: str) -> int:
-    if range_ == "max":
-        return 10_000_000
-    match = re.fullmatch(r"(\d+)(d|w|mo|y|m)", range_)
-    if not match:
-        return 0
-    value = int(match.group(1))
-    unit = match.group(2)
-    if unit == "d":
-        return value
-    if unit == "w":
-        return value * 7
-    if unit == "m":
-        return value / (24 * 60)
-    if unit == "mo":
-        return value * 31
-    if unit == "y":
-        return value * 366
-    return 0
 
 
 def database_url() -> str:
@@ -1599,10 +1516,6 @@ def tradingview_interval(interval: str) -> str:
         "5m": "INTERVAL_5_MINUTES",
         "15m": "INTERVAL_15_MINUTES",
         "30m": "INTERVAL_30_MINUTES",
-        "1h": "INTERVAL_1_HOUR",
-        "2h": "INTERVAL_2_HOURS",
-        "4h": "INTERVAL_4_HOURS",
-        "1d": "INTERVAL_1_DAY",
     }[interval]
     return getattr(TVInterval, attr)
 
@@ -1776,7 +1689,7 @@ class RatingsHandler(BaseHTTPRequestHandler):
         started = time.perf_counter()
         params = urllib.parse.parse_qs(query)
         symbol = params.get("symbol", [DEFAULT_SYMBOL])[0]
-        interval = params.get("interval", ["1d"])[0]
+        interval = params.get("interval", ["30m"])[0]
         range_ = params.get("range", ["2y"])[0]
         csv_path = params.get("csv", [""])[0].strip()
         log_event("ratings.request.start", symbol=symbol, interval=interval, range=range_, csv=bool(csv_path))
@@ -2236,10 +2149,133 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--text);
       font: inherit;
     }
-    input {
-      width: 165px;
-      padding: 0 12px;
+    .search-combobox {
+      position: relative;
+      width: min(360px, 34vw);
+      min-width: 230px;
+    }
+    .search-shell {
+      position: relative;
+      display: flex;
+      align-items: center;
+      height: 44px;
+      border: 1px solid #d7deea;
+      border-radius: 10px;
+      background: #fff;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, .06);
+      transition: border-color .18s, box-shadow .18s;
+    }
+    .search-shell:focus-within {
+      border-color: #8fb0ff;
+      box-shadow: 0 0 0 4px rgba(31, 91, 255, .12), 0 10px 28px rgba(15, 23, 42, .08);
+    }
+    .search-icon {
+      width: 17px;
+      height: 17px;
+      margin-left: 13px;
+      border: 2px solid #778195;
+      border-radius: 50%;
+      flex: 0 0 auto;
+    }
+    .search-icon::after {
+      content: "";
+      position: absolute;
+      width: 7px;
+      height: 2px;
+      margin: 12px 0 0 -1px;
+      background: #778195;
+      transform: rotate(45deg);
+      transform-origin: left center;
+      border-radius: 2px;
+    }
+    #symbol {
+      width: 100%;
+      height: 42px;
+      border: 0;
+      border-radius: 10px;
+      padding: 0 12px 0 10px;
+      font-weight: 800;
+      outline: none;
+      background: transparent;
+      text-transform: uppercase;
+    }
+    .symbol-menu {
+      position: absolute;
+      z-index: 30;
+      top: calc(100% + 8px);
+      left: 0;
+      right: 0;
+      display: none;
+      max-height: 360px;
+      overflow: auto;
+      border: 1px solid #dfe5ef;
+      border-radius: 12px;
+      background: #fff;
+      box-shadow: 0 20px 45px rgba(15, 23, 42, .16);
+      padding: 6px;
+    }
+    .symbol-menu.open { display: block; }
+    .symbol-option {
+      width: 100%;
+      min-height: 58px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      align-items: center;
+      border: 0;
+      border-radius: 8px;
+      background: transparent;
+      padding: 9px 10px;
+      color: #101828;
+      text-align: left;
+      cursor: pointer;
+    }
+    .symbol-option:hover,
+    .symbol-option.active {
+      background: #f2f6ff;
+    }
+    .symbol-name {
+      display: block;
+      font-size: 14px;
+      font-weight: 900;
+      line-height: 1.2;
+      color: #0b0f19;
+    }
+    .symbol-company {
+      display: block;
+      margin-top: 4px;
+      color: #667085;
+      font-size: 12px;
       font-weight: 650;
+      line-height: 1.25;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .symbol-badges {
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+      justify-content: flex-end;
+    }
+    .symbol-badge {
+      border-radius: 999px;
+      background: #eef2f7;
+      color: #475467;
+      padding: 4px 7px;
+      font-size: 11px;
+      font-weight: 900;
+      white-space: nowrap;
+    }
+    .symbol-badge.fo {
+      background: #eaf1ff;
+      color: var(--blue);
+    }
+    .symbol-empty {
+      padding: 13px 12px;
+      color: #667085;
+      font-size: 13px;
+      font-weight: 700;
     }
     .refresh, .kite-login {
       padding: 0 14px;
@@ -2450,7 +2486,7 @@ INDEX_HTML = r"""<!doctype html>
       align-items: center;
       justify-content: space-between;
       gap: 14px;
-      margin-bottom: 16px;
+      margin-bottom: 10px;
     }
     .chain-head h2 {
       margin: 0;
@@ -2462,6 +2498,23 @@ INDEX_HTML = r"""<!doctype html>
       align-items: center;
       flex-wrap: wrap;
     }
+    .expiry-field {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      min-height: 44px;
+      border: 1px solid #dfe5ef;
+      border-radius: 10px;
+      background: #fff;
+      padding: 0 10px 0 13px;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, .05);
+    }
+    .expiry-field span {
+      color: #667085;
+      font-size: 13px;
+      font-weight: 900;
+      text-transform: uppercase;
+    }
     select {
       height: 40px;
       border: 1px solid #d9dde5;
@@ -2471,8 +2524,15 @@ INDEX_HTML = r"""<!doctype html>
       font: inherit;
       font-weight: 650;
     }
+    .expiry-field select {
+      min-width: 140px;
+      border: 0;
+      padding: 0 2px;
+      outline: none;
+      font-weight: 850;
+    }
     .chain-summary {
-      margin-bottom: 14px;
+      margin: 0 0 14px;
       color: var(--muted);
       font-size: 14px;
     }
@@ -2570,7 +2630,7 @@ INDEX_HTML = r"""<!doctype html>
       main { width: min(100vw - 24px, 1440px); padding-top: 14px; }
       .timeframes { overflow-x: auto; flex-wrap: nowrap; padding-bottom: 4px; }
       .tf { font-size: 15px; height: 38px; padding: 0 11px; }
-      input { flex: 1 1 160px; }
+      .search-combobox { width: 100%; min-width: 0; }
       .refresh, .view-toggle, .kite-login { flex: 0 0 auto; }
       .gauge-card { padding: 18px 12px 20px; }
       .gauge-host { height: 205px; }
@@ -2588,14 +2648,15 @@ INDEX_HTML = r"""<!doctype html>
       <button class="tf" type="button" data-interval="5m">5 minutes</button>
       <button class="tf" type="button" data-interval="15m">15 minutes</button>
       <button class="tf active" type="button" data-interval="30m">30 minutes</button>
-      <button class="tf" type="button" data-interval="1h">1 hour</button>
-      <button class="tf" type="button" data-interval="2h">2 hours</button>
-      <button class="tf" type="button" data-interval="4h">4 hours</button>
-      <button class="tf" type="button" data-interval="1d">1 day</button>
     </nav>
     <form class="symbol-form" id="controls">
-      <input id="symbol" value="ASIANPAINT" aria-label="Symbol" list="symbolSuggestions" autocomplete="off">
-      <datalist id="symbolSuggestions"></datalist>
+      <div class="search-combobox">
+        <div class="search-shell">
+          <span class="search-icon" aria-hidden="true"></span>
+          <input id="symbol" value="ASIANPAINT" aria-label="Search stock" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="symbol-menu" id="symbolSuggestions" role="listbox"></div>
+      </div>
       <select id="autoRefresh" aria-label="Auto refresh">
         <option value="0">Auto: Off</option>
         <option value="1000">Auto: 1s</option>
@@ -2663,7 +2724,10 @@ INDEX_HTML = r"""<!doctype html>
     <div class="chain-head">
       <h2>Option Chain</h2>
       <div class="chain-controls">
-        <select id="expirySelect" aria-label="Expiry"></select>
+        <label class="expiry-field">
+          <span>Expiry</span>
+          <select id="expirySelect" aria-label="Expiry"></select>
+        </label>
       </div>
     </div>
     <p class="chain-summary" id="chainMeta">Waiting for option chain</p>
@@ -2721,6 +2785,8 @@ let activeView = "ratings";
 let symbolTimer = 0;
 let autoRefreshTimer = 0;
 let refreshInFlight = false;
+let symbolResults = [];
+let activeSymbolIndex = -1;
 const previousGaugeScores = {};
 
 function labelForSignal(value) {
@@ -3075,15 +3141,63 @@ function setView(view) {
 
 async function loadSymbolSuggestions() {
   const q = symbolInput.value.trim();
-  if (q.length < 2) return;
+  if (q.length < 2) {
+    hideSymbolSuggestions();
+    return;
+  }
+  renderSymbolSuggestionState("Searching...");
   const response = await fetch(`/api/symbols?q=${encodeURIComponent(q)}&limit=30`);
   const payload = await response.json();
-  if (!payload.ok) return;
-  symbolSuggestions.innerHTML = payload.data.map(item => {
-    const tag = item.optionable ? " | F&O" : "";
-    const kind = item.kind ? ` | ${item.kind}` : "";
-    return `<option value="${escapeHtml(item.symbol)}" label="${escapeHtml(`${item.tradingsymbol}${kind}${tag} - ${item.name}`)}"></option>`;
+  if (!payload.ok) {
+    hideSymbolSuggestions();
+    return;
+  }
+  symbolResults = payload.data || [];
+  activeSymbolIndex = symbolResults.length ? 0 : -1;
+  renderSymbolSuggestions();
+}
+
+function renderSymbolSuggestionState(message) {
+  symbolResults = [];
+  activeSymbolIndex = -1;
+  symbolSuggestions.innerHTML = `<div class="symbol-empty">${escapeHtml(message)}</div>`;
+  symbolSuggestions.classList.add("open");
+}
+
+function renderSymbolSuggestions() {
+  if (!symbolResults.length) {
+    renderSymbolSuggestionState("No matching stocks found");
+    return;
+  }
+  symbolSuggestions.innerHTML = symbolResults.map((item, index) => {
+    const active = index === activeSymbolIndex ? " active" : "";
+    const kind = item.kind || "Stock";
+    const fo = item.optionable ? `<span class="symbol-badge fo">F&O</span>` : "";
+    return `<button class="symbol-option${active}" type="button" role="option" data-index="${index}" aria-selected="${index === activeSymbolIndex}">
+      <span>
+        <span class="symbol-name">${escapeHtml(item.tradingsymbol || item.symbol)}</span>
+        <span class="symbol-company">${escapeHtml(item.name || "")}</span>
+      </span>
+      <span class="symbol-badges">
+        <span class="symbol-badge">${escapeHtml(kind)}</span>
+        ${fo}
+      </span>
+    </button>`;
   }).join("");
+  symbolSuggestions.classList.add("open");
+}
+
+function hideSymbolSuggestions() {
+  symbolSuggestions.classList.remove("open");
+  activeSymbolIndex = -1;
+}
+
+function chooseSymbol(index) {
+  const item = symbolResults[index];
+  if (!item) return;
+  symbolInput.value = item.symbol || item.tradingsymbol;
+  hideSymbolSuggestions();
+  runCurrentRefresh();
 }
 
 tfButtons.forEach(button => {
@@ -3147,6 +3261,39 @@ symbolInput.addEventListener("input", () => {
   symbolTimer = setTimeout(() => loadSymbolSuggestions().catch(() => {}), 180);
 });
 
+symbolInput.addEventListener("focus", () => {
+  if (symbolResults.length) renderSymbolSuggestions();
+});
+
+symbolInput.addEventListener("keydown", event => {
+  if (!symbolSuggestions.classList.contains("open")) return;
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    activeSymbolIndex = Math.min(symbolResults.length - 1, activeSymbolIndex + 1);
+    renderSymbolSuggestions();
+  } else if (event.key === "ArrowUp") {
+    event.preventDefault();
+    activeSymbolIndex = Math.max(0, activeSymbolIndex - 1);
+    renderSymbolSuggestions();
+  } else if (event.key === "Enter" && activeSymbolIndex >= 0) {
+    event.preventDefault();
+    chooseSymbol(activeSymbolIndex);
+  } else if (event.key === "Escape") {
+    hideSymbolSuggestions();
+  }
+});
+
+symbolSuggestions.addEventListener("mousedown", event => {
+  const option = event.target.closest(".symbol-option");
+  if (!option) return;
+  event.preventDefault();
+  chooseSymbol(Number(option.dataset.index));
+});
+
+document.addEventListener("mousedown", event => {
+  if (!event.target.closest(".search-combobox")) hideSymbolSuggestions();
+});
+
 autoRefreshSelect.addEventListener("change", configureAutoRefresh);
 
 toggleViewButton.addEventListener("click", () => {
@@ -3208,7 +3355,7 @@ def run_cli(symbol: str, csv_path: str | None, interval: str, range_: str) -> No
 def main() -> None:
     parser = argparse.ArgumentParser(description="TradingView-style Technical Ratings gauge")
     parser.add_argument("--symbol", default=DEFAULT_SYMBOL)
-    parser.add_argument("--interval", default="1d")
+    parser.add_argument("--interval", default="30m")
     parser.add_argument("--range", default="2y")
     parser.add_argument("--csv", default=None, help="CSV path with Open, High, Low, Close, Volume columns")
     parser.add_argument("--cli", action="store_true", help="Print JSON instead of starting the web app")

@@ -73,7 +73,7 @@ KITE_ACCESS_TOKEN=your_daily_access_token
 ## CLI
 
 ```powershell
-python app.py --cli --symbol ASIANPAINT.NS --interval 1d --range 2y
+python app.py --cli --symbol ASIANPAINT.NS --interval 30m --range 2y
 ```
 
 Print Kite login URL:
