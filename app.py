@@ -680,6 +680,9 @@ def option_quote_payload(row, quote: dict) -> dict:
         "ltp": quote.get("last_price"),
         "change": quote.get("net_change"),
         "oi": quote.get("oi"),
+        "oi_change": quote.get("oi_change")
+        or quote.get("change_in_oi")
+        or quote.get("oi_day_change"),
         "volume": quote.get("volume"),
         "bid": best_depth_price(quote, "buy"),
         "ask": best_depth_price(quote, "sell"),
@@ -2029,36 +2032,94 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--muted);
       font-size: 14px;
     }
+    .chain-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 26px;
+      align-items: start;
+    }
+    .option-board {
+      min-width: 0;
+      border: 3px solid var(--board);
+      background: #fff;
+    }
+    .option-board.call { --board: #119b45; --head: #09a74d; --soft-head: #e9fff0; --grid: #a7d8b8; }
+    .option-board.put { --board: #c51f3c; --head: #811337; --soft-head: #fff0f3; --grid: #e7a4b1; }
+    .option-board h3 {
+      margin: 0;
+      padding: 9px 10px;
+      color: #fff;
+      background: var(--head);
+      text-align: center;
+      font-size: 20px;
+      line-height: 1.1;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+    .chain-scroll { overflow-x: auto; }
     .option-table {
       width: 100%;
       border-collapse: collapse;
-      table-layout: auto;
+      table-layout: fixed;
     }
     .option-table th {
-      background: #f8fafc;
-      color: #4b5563;
+      padding: 8px 6px;
+      border: 2px solid var(--grid);
+      background: var(--head);
+      color: #fff;
+      text-align: center;
       font-size: 13px;
-      white-space: nowrap;
+      font-weight: 900;
+      line-height: 1.1;
+      white-space: normal;
+      text-transform: uppercase;
     }
+    .option-table th.strike-head {
+      background: var(--soft-head);
+      color: #126b46;
+      text-decoration: underline;
+    }
+    .put .option-table th.strike-head { color: #811337; }
     .option-table td {
+      padding: 7px 6px;
+      border: 2px solid var(--grid);
+      color: #111827;
+      background: #fff;
+      text-align: center;
+      font-size: 15px;
+      font-weight: 800;
       font-variant-numeric: tabular-nums;
       white-space: nowrap;
     }
-    .strike-cell {
-      background: #fbfdff;
+    .option-table .strike-cell {
+      background: #f8fff9;
       color: #111827;
-      font-weight: 850;
-      text-align: center;
+      font-weight: 900;
     }
-    .call-side { color: #126b46; }
-    .put-side { color: #9f1239; }
-    .chain-scroll { overflow-x: auto; }
+    .put .option-table .strike-cell { background: #fff8fa; }
+    .option-table .atm-cell {
+      background: #0f86a6 !important;
+      color: #06121a;
+    }
+    .oi-change.positive {
+      background: #20b52b;
+      color: #071b08;
+    }
+    .oi-change.negative {
+      background: #ff3b18;
+      color: #1f0801;
+    }
+    .oi-change.flat {
+      background: #f8fafc;
+      color: #111827;
+    }
     @media (max-width: 1180px) {
       .topbar { align-items: stretch; flex-direction: column; margin-bottom: 28px; }
       .symbol-form { justify-content: flex-start; }
       .gauges { grid-template-columns: 1fr; gap: 18px; }
       .summary { order: -1; }
       .tables { grid-template-columns: 1fr; }
+      .chain-grid { grid-template-columns: 1fr; }
       .chain-head { align-items: stretch; flex-direction: column; }
     }
     @media (max-width: 560px) {
@@ -2162,17 +2223,41 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </div>
     <p class="chain-summary" id="chainMeta">Waiting for option chain</p>
-    <div class="chain-scroll">
-      <table class="option-table">
-        <thead>
-          <tr>
-            <th class="call-side">CE OI</th><th class="call-side">CE Vol</th><th class="call-side">CE Bid</th><th class="call-side">CE LTP</th><th class="call-side">CE Ask</th>
-            <th>Strike</th>
-            <th class="put-side">PE Bid</th><th class="put-side">PE LTP</th><th class="put-side">PE Ask</th><th class="put-side">PE Vol</th><th class="put-side">PE OI</th>
-          </tr>
-        </thead>
-        <tbody id="chainRows"></tbody>
-      </table>
+    <div class="chain-grid">
+      <section class="option-board call">
+        <h3 id="callTitle">Call Option</h3>
+        <div class="chain-scroll">
+          <table class="option-table">
+            <thead>
+              <tr>
+                <th class="strike-head">Strike</th>
+                <th>Last</th>
+                <th>Open Int</th>
+                <th>Change In OI</th>
+                <th>OI %</th>
+              </tr>
+            </thead>
+            <tbody id="callRows"></tbody>
+          </table>
+        </div>
+      </section>
+      <section class="option-board put">
+        <h3 id="putTitle">Put Option</h3>
+        <div class="chain-scroll">
+          <table class="option-table">
+            <thead>
+              <tr>
+                <th class="strike-head">Strike</th>
+                <th>Last</th>
+                <th>Open Int</th>
+                <th>Change In OI</th>
+                <th>OI %</th>
+              </tr>
+            </thead>
+            <tbody id="putRows"></tbody>
+          </table>
+        </div>
+      </section>
     </div>
   </section>
 </main>
@@ -2455,31 +2540,62 @@ function opt(side, key) {
   return side && side[key] !== undefined ? side[key] : null;
 }
 
+function oiChange(side) {
+  const value = opt(side, "oi_change");
+  return value === null || value === undefined ? null : Number(value);
+}
+
+function oiPercent(side) {
+  const change = oiChange(side);
+  const oi = opt(side, "oi");
+  if (change === null || oi === null || oi === undefined || Number(oi) === 0) return null;
+  const previous = Number(oi) - change;
+  if (!Number.isFinite(previous) || previous <= 0) return null;
+  return (change / previous) * 100;
+}
+
+function oiClass(value) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value)) || Number(value) === 0) return "flat";
+  return Number(value) > 0 ? "positive" : "negative";
+}
+
+function percent(value) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return "-";
+  return `${Math.round(Number(value))} %`;
+}
+
+function optionRows(rows, sideKey, atmStrike) {
+  return rows.map(row => {
+    const side = row[sideKey] || {};
+    const change = oiChange(side);
+    const pct = oiPercent(side);
+    const atm = Number(row.strike) === Number(atmStrike) ? " atm-cell" : "";
+    return `<tr>
+      <td class="strike-cell${atm}">${money(row.strike)}</td>
+      <td>${money(opt(side, "ltp"))}</td>
+      <td>${integer(opt(side, "oi"))}</td>
+      <td class="oi-change ${oiClass(change)}">${integer(change)}</td>
+      <td>${percent(pct)}</td>
+    </tr>`;
+  }).join("");
+}
+
 function renderOptionChain(data) {
   document.getElementById("chainMeta").textContent =
     `${data.symbol} | Spot ${money(data.spot)} | Expiry ${data.expiry}`;
+  document.getElementById("callTitle").textContent = `${data.option_underlying || data.symbol} Call Option`;
+  document.getElementById("putTitle").textContent = `${data.option_underlying || data.symbol} Put Option`;
   const previousExpiry = expirySelect.value;
   expirySelect.innerHTML = data.expiries.map(expiry => {
     const selected = expiry === data.expiry || expiry === previousExpiry ? "selected" : "";
     return `<option value="${escapeHtml(expiry)}" ${selected}>${escapeHtml(expiry)}</option>`;
   }).join("");
-  document.getElementById("chainRows").innerHTML = data.rows.map(row => {
-    const ce = row.CE || {};
-    const pe = row.PE || {};
-    return `<tr>
-      <td class="call-side">${integer(opt(ce, "oi"))}</td>
-      <td class="call-side">${integer(opt(ce, "volume"))}</td>
-      <td class="call-side">${money(opt(ce, "bid"))}</td>
-      <td class="call-side">${money(opt(ce, "ltp"))}</td>
-      <td class="call-side">${money(opt(ce, "ask"))}</td>
-      <td class="strike-cell">${money(row.strike)}</td>
-      <td class="put-side">${money(opt(pe, "bid"))}</td>
-      <td class="put-side">${money(opt(pe, "ltp"))}</td>
-      <td class="put-side">${money(opt(pe, "ask"))}</td>
-      <td class="put-side">${integer(opt(pe, "volume"))}</td>
-      <td class="put-side">${integer(opt(pe, "oi"))}</td>
-    </tr>`;
-  }).join("");
+  const atmStrike = data.rows.reduce((best, row) => {
+    if (best === null) return row.strike;
+    return Math.abs(Number(row.strike) - Number(data.spot)) < Math.abs(Number(best) - Number(data.spot)) ? row.strike : best;
+  }, null);
+  document.getElementById("callRows").innerHTML = optionRows(data.rows, "CE", atmStrike);
+  document.getElementById("putRows").innerHTML = optionRows(data.rows, "PE", atmStrike);
 }
 
 async function loadOptionChain() {
