@@ -1913,10 +1913,10 @@ LOGIN_HTML = r"""<!doctype html>
       padding: 24px;
     }
     .shell {
-      width: min(1040px, 100%);
+      width: min(980px, 100%);
       display: grid;
       grid-template-columns: 1fr 1fr;
-      min-height: 650px;
+      min-height: 610px;
       border-radius: 22px;
       background: #fff;
       box-shadow: 0 34px 90px rgba(28, 39, 69, .18);
@@ -2397,7 +2397,6 @@ LOGIN_HTML = r"""<!doctype html>
             </svg>
           </button>
         </form>
-        <p class="foot">Set <code>APP_USERNAME</code>, <code>APP_PASSWORD</code>, and <code>APP_SESSION_SECRET</code> before public deployment.</p>
         """ + ("" if auth_configured() else "<p class='setup'>APP_PASSWORD is not set. Login is disabled until you configure it.</p>") + r"""
       </div>
     </section>
@@ -2437,7 +2436,7 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--text);
     }
     main {
-      width: min(1620px, calc(100vw - 40px));
+      width: min(1880px, calc(100vw - 28px));
       margin: 0 auto;
       padding: 24px 0 42px;
     }
@@ -2451,8 +2450,9 @@ INDEX_HTML = r"""<!doctype html>
     .topbar-left {
       display: flex;
       align-items: center;
-      gap: 22px;
+      gap: 18px;
       min-width: 0;
+      flex: 1 1 auto;
     }
     .app-logo {
       display: inline-flex;
@@ -2476,7 +2476,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .app-logo-text {
       color: #101828;
-      font-size: 20px;
+      font-size: 19px;
       font-weight: 900;
       letter-spacing: 0;
       white-space: nowrap;
@@ -2485,8 +2485,8 @@ INDEX_HTML = r"""<!doctype html>
     .timeframes {
       display: flex;
       align-items: center;
-      gap: 8px;
-      flex-wrap: wrap;
+      gap: 6px;
+      flex-wrap: nowrap;
     }
     .tf {
       height: 44px;
@@ -2494,8 +2494,8 @@ INDEX_HTML = r"""<!doctype html>
       border-radius: 8px;
       background: transparent;
       color: #05070c;
-      padding: 0 16px;
-      font-size: 17px;
+      padding: 0 14px;
+      font-size: 16px;
       font-weight: 700;
       cursor: pointer;
       white-space: nowrap;
@@ -2508,6 +2508,8 @@ INDEX_HTML = r"""<!doctype html>
       display: flex;
       gap: 10px;
       align-items: center;
+      flex: 0 0 auto;
+      flex-wrap: nowrap;
     }
     input, .refresh, .kite-login {
       height: 40px;
@@ -2519,8 +2521,8 @@ INDEX_HTML = r"""<!doctype html>
     }
     .search-combobox {
       position: relative;
-      width: min(360px, 34vw);
-      min-width: 230px;
+      width: clamp(260px, 24vw, 450px);
+      min-width: 220px;
     }
     .search-shell {
       position: relative;
