@@ -1913,10 +1913,10 @@ LOGIN_HTML = r"""<!doctype html>
       padding: 24px;
     }
     .shell {
-      width: min(980px, 100%);
+      width: min(920px, 100%);
       display: grid;
       grid-template-columns: 1fr 1fr;
-      min-height: 610px;
+      min-height: 570px;
       border-radius: 22px;
       background: #fff;
       box-shadow: 0 34px 90px rgba(28, 39, 69, .18);
@@ -1924,7 +1924,7 @@ LOGIN_HTML = r"""<!doctype html>
     }
     .brand {
       position: relative;
-      padding: 48px 44px 36px;
+      padding: 38px 38px 30px;
       display: flex;
       flex-direction: column;
       justify-content: space-between;
@@ -1976,7 +1976,7 @@ LOGIN_HTML = r"""<!doctype html>
     }
     .sr-radar {
       position: relative;
-      width: min(350px, 86%);
+      width: min(305px, 82%);
       aspect-ratio: 1;
       overflow: hidden;
       border-radius: 50%;
@@ -2134,7 +2134,7 @@ LOGIN_HTML = r"""<!doctype html>
     .sr-tick .up { color: #1ba672; }
     .sr-tick .down { color: #e5484d; }
     .panel {
-      padding: clamp(48px, 6vw, 64px);
+      padding: clamp(40px, 5vw, 54px);
       display: flex;
       flex-direction: column;
       justify-content: center;
@@ -2294,7 +2294,7 @@ LOGIN_HTML = r"""<!doctype html>
       .shell { grid-template-columns: 1fr; }
       .brand { min-height: 560px; padding: 34px; }
       .panel { padding: 38px 34px; }
-      .sr-radar { width: min(320px, 92%); }
+      .sr-radar { width: min(292px, 92%); }
     }
     @media (max-width: 520px) {
       body { padding: 14px; }
