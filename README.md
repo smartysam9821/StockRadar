@@ -48,20 +48,17 @@ Paste the generated value into `.env` as `APP_SESSION_SECRET`.
 Values in `.env` are loaded at app startup and override same-named variables already present in the shell or service environment.
 
 ```powershell
-python app.py --host 127.0.0.1 --port 8765
+python app.py
 ```
 
-Open:
+By default, this binds to `0.0.0.0:80`, so open the server with your public IP or local address:
 
 ```text
-http://127.0.0.1:8765
+http://127.0.0.1/
+http://YOUR_PUBLIC_IP/
 ```
 
-If you do not already have a daily access token, open:
-
-```text
-http://127.0.0.1:8765/kite/login
-```
+If you do not already have a daily access token, login to the app and click **Connect Kite**.
 
 After Kite redirects back with a `request_token`, the app exchanges it for an access token and keeps it in server memory.
 It also saves the token locally at `data/kite_access_token.json` for the current date, so server restarts do not require login again until Kite expires the token.

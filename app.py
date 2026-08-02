@@ -2431,8 +2431,8 @@ def main() -> None:
     parser.add_argument("--cli", action="store_true", help="Print JSON instead of starting the web app")
     parser.add_argument("--kite-login-url", action="store_true", help="Print Kite Connect login URL")
     parser.add_argument("--kite-request-token", default=None, help="Exchange Kite request_token for access_token")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=80)
     args = parser.parse_args()
 
     if args.kite_login_url:
