@@ -2,3 +2,4 @@ pandas>=2.2,<3
 numpy>=1.26,<3
 kiteconnect>=5.0,<6
 tradingview-ta>=3.3,<4
+psycopg[binary]>=3.2,<4

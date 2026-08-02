@@ -23,6 +23,10 @@ from pathlib import Path
 import pandas as pd
 from kiteconnect import KiteConnect
 try:
+    import psycopg
+except ImportError:  # Optional PostgreSQL event sink.
+    psycopg = None
+try:
     from tradingview_ta import Interval as TVInterval
     from tradingview_ta import TA_Handler
 except ImportError:  # Optional production confirmation layer.
@@ -60,11 +64,24 @@ KITE_ACCESS_TOKEN_MEMORY = ""
 APP_SESSION_COOKIE = "stock_app_session"
 ALLOWED_INTERVALS = {"1m", "5m", "15m", "30m", "1h", "2h", "4h", "1d", "1wk", "1mo"}
 ALLOWED_RANGES = {"1d", "5d", "7d", "30d", "60d", "90d", "6mo", "1y", "2y", "5y", "10y", "max"}
-SYMBOL_RE = re.compile(r"^(?:[A-Z]{2,5}:)?[A-Z0-9&.\-]{1,32}(?:\.NS)?$")
+SYMBOL_RE = re.compile(r"^(?:[A-Z]{2,5}:)?[A-Z0-9&.\- ]{1,40}(?:\.NS)?$")
+INDEX_OPTION_UNDERLYING_ALIASES = {
+    "NIFTY 50": "NIFTY",
+    "NIFTY BANK": "BANKNIFTY",
+    "NIFTY FIN SERVICE": "FINNIFTY",
+    "NIFTY MID SELECT": "MIDCPNIFTY",
+}
+TRADINGVIEW_SYMBOL_ALIASES = {
+    "NIFTY 50": "NIFTY",
+    "NIFTY BANK": "BANKNIFTY",
+    "NIFTY FIN SERVICE": "CNXFINANCE",
+}
 TOKEN_LOCK = threading.RLock()
 INSTRUMENT_LOCK = threading.RLock()
 INSTRUMENT_CACHE_FRAME: pd.DataFrame | None = None
 REQUEST_CONTEXT = threading.local()
+DB_LOCK = threading.RLock()
+DB_READY = False
 TV_CONFIRMATION_LOCK = threading.RLock()
 TV_CONFIRMATION_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
 TV_INTERVALS = {
@@ -378,6 +395,14 @@ def normalize_kite_symbol(symbol: str) -> tuple[str, str]:
     return "NSE", clean
 
 
+def option_underlying_symbol(tradingsymbol: str) -> str:
+    return INDEX_OPTION_UNDERLYING_ALIASES.get(tradingsymbol.upper(), tradingsymbol.upper())
+
+
+def tradingview_symbol(tradingsymbol: str) -> str:
+    return TRADINGVIEW_SYMBOL_ALIASES.get(tradingsymbol.upper(), tradingsymbol.upper())
+
+
 def kite_source_interval(interval: str) -> str:
     mapping = {
         "1m": "minute",
@@ -534,6 +559,8 @@ def search_symbols(query: str, limit: int = 25) -> list[dict]:
         haystack = f"{tradingsymbol} {name}"
         if not q:
             score = 0.1
+        elif q == tradingsymbol or q == name:
+            score = 1.25
         elif q in haystack:
             score = 1.0 if tradingsymbol.startswith(q) else 0.85
         else:
@@ -542,13 +569,15 @@ def search_symbols(query: str, limit: int = 25) -> list[dict]:
                 difflib.SequenceMatcher(None, q, name).ratio(),
             )
         if not q or score >= 0.45:
-            optionable = tradingsymbol in option_names
+            optionable = tradingsymbol in option_names or option_underlying_symbol(tradingsymbol) in option_names
+            segment = str(row.get("segment", ""))
             rows.append(
                 {
                     "symbol": tradingsymbol,
                     "tradingsymbol": tradingsymbol,
                     "name": str(row["name"]),
                     "optionable": optionable,
+                    "kind": "Index" if segment.upper() == "INDICES" else "Stock",
                     "score": score + (0.05 if optionable else 0),
                 }
             )
@@ -576,10 +605,11 @@ def fetch_option_chain(symbol: str, expiry: str = "", strikes_each_side: int = 8
         raise ValueError("Kite session not connected. Open /kite/login and complete Kite login once.")
 
     _, underlying = normalize_kite_symbol(symbol)
+    option_underlying = option_underlying_symbol(underlying)
     instruments = load_kite_instruments()
     options = instruments[
         (instruments["exchange"].astype(str).str.upper() == "NFO")
-        & (instruments["name"].astype(str).str.upper() == underlying)
+        & (instruments["name"].astype(str).str.upper() == option_underlying)
         & (instruments["instrument_type"].astype(str).str.upper().isin(["CE", "PE"]))
     ].copy()
     if options.empty:
@@ -621,6 +651,7 @@ def fetch_option_chain(symbol: str, expiry: str = "", strikes_each_side: int = 8
     rows = [by_strike[strike] for strike in sorted(by_strike)]
     payload = {
         "symbol": underlying,
+        "option_underlying": option_underlying,
         "spot": spot,
         "expiry": selected_expiry.isoformat(),
         "expiries": [item.isoformat() for item in future_expiries[:12]],
@@ -763,6 +794,183 @@ def _range_rank(range_: str) -> int:
     return 0
 
 
+def database_url() -> str:
+    return os.environ.get("DATABASE_URL", "").strip()
+
+
+def database_enabled() -> bool:
+    return bool(database_url())
+
+
+def db_connect():
+    if psycopg is None:
+        raise RuntimeError("Install psycopg[binary] to enable PostgreSQL event logging.")
+    return psycopg.connect(database_url(), connect_timeout=10)
+
+
+def ensure_events_table() -> bool:
+    global DB_READY
+    if not database_enabled():
+        log_event("db.skip", reason="database_url_missing")
+        return False
+    if psycopg is None:
+        log_event("db.skip", "warning", reason="psycopg_missing")
+        return False
+    with DB_LOCK:
+        if DB_READY:
+            return True
+        started = time.perf_counter()
+        try:
+            with db_connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS events (
+                            id BIGSERIAL PRIMARY KEY,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                            request_id TEXT,
+                            symbol TEXT NOT NULL,
+                            interval TEXT NOT NULL,
+                            signal TEXT NOT NULL CHECK (signal IN ('STRONG_BUY', 'STRONG_SELL')),
+                            price DOUBLE PRECISION,
+                            bars INTEGER,
+                            overall_score DOUBLE PRECISION,
+                            oscillator_score DOUBLE PRECISION,
+                            ma_score DOUBLE PRECISION,
+                            local_overall_label TEXT,
+                            local_oscillator_label TEXT,
+                            local_ma_label TEXT,
+                            tv_summary TEXT NOT NULL,
+                            tv_oscillators TEXT NOT NULL,
+                            tv_moving_averages TEXT NOT NULL,
+                            tv_cache TEXT,
+                            tv_counts JSONB,
+                            payload JSONB
+                        )
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_events_symbol_interval_created
+                        ON events (symbol, interval, created_at DESC)
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_events_signal_created
+                        ON events (signal, created_at DESC)
+                        """
+                    )
+            DB_READY = True
+            log_event("db.events_table.ready", duration_ms=int((time.perf_counter() - started) * 1000))
+            return True
+        except Exception as exc:
+            log_event(
+                "db.events_table.error",
+                "error",
+                error=str(exc),
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
+            return False
+
+
+def store_confirmed_event(result: RatingResult, interval: str, bars: int, tv: dict) -> bool:
+    if not tv.get("applied") or not ensure_events_table():
+        return False
+    signal = "STRONG_BUY" if tv.get("summary") == "STRONG_BUY" else "STRONG_SELL"
+    started = time.perf_counter()
+    payload = {
+        "local": result_to_dict(result),
+        "tradingview": tv,
+    }
+    try:
+        with db_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO events (
+                        request_id,
+                        symbol,
+                        interval,
+                        signal,
+                        price,
+                        bars,
+                        overall_score,
+                        oscillator_score,
+                        ma_score,
+                        local_overall_label,
+                        local_oscillator_label,
+                        local_ma_label,
+                        tv_summary,
+                        tv_oscillators,
+                        tv_moving_averages,
+                        tv_cache,
+                        tv_counts,
+                        payload
+                    )
+                    VALUES (
+                        %(request_id)s,
+                        %(symbol)s,
+                        %(interval)s,
+                        %(signal)s,
+                        %(price)s,
+                        %(bars)s,
+                        %(overall_score)s,
+                        %(oscillator_score)s,
+                        %(ma_score)s,
+                        %(local_overall_label)s,
+                        %(local_oscillator_label)s,
+                        %(local_ma_label)s,
+                        %(tv_summary)s,
+                        %(tv_oscillators)s,
+                        %(tv_moving_averages)s,
+                        %(tv_cache)s,
+                        %(tv_counts)s::jsonb,
+                        %(payload)s::jsonb
+                    )
+                    """,
+                    {
+                        "request_id": current_request_id(),
+                        "symbol": result.symbol,
+                        "interval": interval,
+                        "signal": signal,
+                        "price": result.price,
+                        "bars": bars,
+                        "overall_score": result.overall_score,
+                        "oscillator_score": result.oscillator_score,
+                        "ma_score": result.ma_score,
+                        "local_overall_label": result.overall_label,
+                        "local_oscillator_label": result.oscillator_label,
+                        "local_ma_label": result.ma_label,
+                        "tv_summary": tv.get("summary"),
+                        "tv_oscillators": tv.get("oscillators"),
+                        "tv_moving_averages": tv.get("moving_averages"),
+                        "tv_cache": tv.get("cache"),
+                        "tv_counts": json.dumps(tv.get("counts", {})),
+                        "payload": json.dumps(payload),
+                    },
+                )
+        log_event(
+            "db.event.inserted",
+            symbol=result.symbol,
+            interval=interval,
+            signal=signal,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
+        return True
+    except Exception as exc:
+        log_event(
+            "db.event.error",
+            "error",
+            symbol=result.symbol,
+            interval=interval,
+            signal=signal,
+            error=str(exc),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
+        return False
+
+
 def maybe_confirm_extreme_with_tradingview(result: RatingResult, interval: str) -> dict:
     started = time.perf_counter()
     local_extreme = local_extreme_side(result)
@@ -881,7 +1089,8 @@ def tradingview_unanimous_extreme_side(tv: dict) -> str:
 def fetch_tradingview_recommendation(symbol: str, interval: str) -> dict:
     started = time.perf_counter()
     exchange, tradingsymbol = normalize_kite_symbol(symbol)
-    cache_key = (f"{exchange}:{tradingsymbol}", interval)
+    tv_symbol = tradingview_symbol(tradingsymbol)
+    cache_key = (f"{exchange}:{tv_symbol}", interval)
     now = time.time()
     ttl = tradingview_cache_ttl_seconds()
     with TV_CONFIRMATION_LOCK:
@@ -901,7 +1110,7 @@ def fetch_tradingview_recommendation(symbol: str, interval: str) -> dict:
 
     log_event("tradingview.fetch.start", symbol=cache_key[0], interval=interval)
     handler = TA_Handler(
-        symbol=tradingsymbol,
+        symbol=tv_symbol,
         screener="india",
         exchange=exchange,
         interval=tradingview_interval(interval),
@@ -913,7 +1122,8 @@ def fetch_tradingview_recommendation(symbol: str, interval: str) -> dict:
     moving_averages = normalize_tv_recommendation(analysis.moving_averages.get("RECOMMENDATION", ""))
     payload = {
         "source": "TradingView",
-        "symbol": f"{exchange}:{tradingsymbol}",
+        "symbol": f"{exchange}:{tv_symbol}",
+        "kite_symbol": f"{exchange}:{tradingsymbol}",
         "interval": interval,
         "summary": summary,
         "oscillators": oscillators,
@@ -1134,6 +1344,7 @@ class RatingsHandler(BaseHTTPRequestHandler):
             df = load_csv(csv_path) if csv_path else fetch_kite_ohlcv(symbol, interval, range_)
             result = technical_ratings(df, symbol=symbol)
             confirmation = maybe_confirm_extreme_with_tradingview(result, validate_interval(interval))
+            event_stored = store_confirmed_event(result, validate_interval(interval), len(df), confirmation)
             log_event(
                 "ratings.request.success",
                 symbol=symbol,
@@ -1144,6 +1355,7 @@ class RatingsHandler(BaseHTTPRequestHandler):
                 moving_averages=result.ma_label,
                 confirmation_checked=confirmation.get("checked", False),
                 confirmation_applied=confirmation.get("applied", False),
+                event_stored=event_stored,
                 duration_ms=int((time.perf_counter() - started) * 1000),
             )
             self._send_json(
@@ -1152,6 +1364,7 @@ class RatingsHandler(BaseHTTPRequestHandler):
                     "data": result_to_dict(result),
                     "bars": len(df),
                     "confirmation": confirmation,
+                    "event_stored": event_stored,
                 }
             )
         except ValueError as exc:
@@ -1222,6 +1435,8 @@ class RatingsHandler(BaseHTTPRequestHandler):
             "data_dir": str(DATA_DIR),
             "log_file": str(LOG_FILE_PATH) if LOG_FILE_PATH else "",
             "tradingview_confirmation": tradingview_confirmation_enabled(),
+            "database_enabled": database_enabled(),
+            "database_ready": DB_READY,
         }
         log_event("health.success", **payload)
         self._send_json(payload)
@@ -2306,7 +2521,8 @@ async function loadSymbolSuggestions() {
   if (!payload.ok) return;
   symbolSuggestions.innerHTML = payload.data.map(item => {
     const tag = item.optionable ? " | F&O" : "";
-    return `<option value="${escapeHtml(item.symbol)}" label="${escapeHtml(`${item.tradingsymbol}${tag} - ${item.name}`)}"></option>`;
+    const kind = item.kind ? ` | ${item.kind}` : "";
+    return `<option value="${escapeHtml(item.symbol)}" label="${escapeHtml(`${item.tradingsymbol}${kind}${tag} - ${item.name}`)}"></option>`;
   }).join("");
 }
 
@@ -2388,6 +2604,7 @@ load().catch(showError);
 
 def run_server(host: str, port: int) -> None:
     validate_runtime_config(host)
+    ensure_events_table()
     server = ThreadingHTTPServer((host, port), RatingsHandler)
     log_event(
         "server.start",
@@ -2397,6 +2614,7 @@ def run_server(host: str, port: int) -> None:
         log_to_file=os.environ.get("STOCKRADAR_LOG_TO_FILE", "true"),
         log_file=str(LOG_FILE_PATH) if LOG_FILE_PATH else "",
         tradingview_confirmation=tradingview_confirmation_enabled(),
+        database_enabled=database_enabled(),
     )
     print(f"Technical Ratings app running at http://{host}:{port}")
     if LOG_FILE_PATH:

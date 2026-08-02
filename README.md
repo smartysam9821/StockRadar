@@ -30,6 +30,7 @@ TRADINGVIEW_CONFIRMATION_ENABLED=true
 TRADINGVIEW_CONFIRMATION_TTL_SECONDS=300
 STOCKRADAR_LOG_LEVEL=INFO
 STOCKRADAR_LOG_TO_FILE=true
+# DATABASE_URL=postgresql://user:password@host:5432/database
 ```
 
 Generate `APP_SESSION_SECRET` from **cmd.exe**:
@@ -167,6 +168,23 @@ To verify logging after deployment, open the app and then request:
 ```
 
 You should see `request.start`, `health.success`, and `request.end` entries in the log file.
+
+## Event Storage
+
+Set `DATABASE_URL` to enable PostgreSQL event logging:
+
+```env
+DATABASE_URL=postgresql://user:password@host:5432/database
+```
+
+On startup, StockRadar creates the `events` table if it does not exist. A row is inserted only when:
+
+- all three local gauges are on the same side,
+- TradingView is checked,
+- TradingView returns all three groups as `STRONG_BUY` or all three as `STRONG_SELL`,
+- the confirmed strong signal is applied to the UI.
+
+The event row includes symbol, timeframe, signal, price, bars, local scores/labels, TradingView recommendations/counts, payload JSON, and request id.
 
 ## Accuracy Notes
 
