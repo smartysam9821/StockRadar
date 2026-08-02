@@ -1913,10 +1913,10 @@ LOGIN_HTML = r"""<!doctype html>
       padding: 24px;
     }
     .shell {
-      width: min(1170px, 100%);
+      width: min(1040px, 100%);
       display: grid;
       grid-template-columns: 1fr 1fr;
-      min-height: 724px;
+      min-height: 650px;
       border-radius: 22px;
       background: #fff;
       box-shadow: 0 34px 90px rgba(28, 39, 69, .18);
@@ -2448,6 +2448,40 @@ INDEX_HTML = r"""<!doctype html>
       gap: 20px;
       margin-bottom: 32px;
     }
+    .topbar-left {
+      display: flex;
+      align-items: center;
+      gap: 22px;
+      min-width: 0;
+    }
+    .app-logo {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      flex: 0 0 auto;
+      text-decoration: none;
+    }
+    .app-logo-mark {
+      width: 34px;
+      height: 34px;
+      display: grid;
+      place-items: center;
+      border-radius: 9px;
+      background: linear-gradient(135deg, #3b6fef, #7c4def);
+      box-shadow: 0 10px 20px rgba(59, 111, 239, .22);
+    }
+    .app-logo-mark svg {
+      width: 18px;
+      height: 18px;
+    }
+    .app-logo-text {
+      color: #101828;
+      font-size: 20px;
+      font-weight: 900;
+      letter-spacing: 0;
+      white-space: nowrap;
+    }
+    .app-logo-text span { color: #12b6ac; }
     .timeframes {
       display: flex;
       align-items: center;
@@ -2953,6 +2987,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     @media (max-width: 1180px) {
       .topbar { align-items: stretch; flex-direction: column; margin-bottom: 28px; }
+      .topbar-left { align-items: flex-start; flex-direction: column; gap: 14px; }
       .symbol-form { justify-content: flex-start; }
       .gauges { grid-template-columns: 1fr; gap: 18px; }
       .summary { order: -1; }
@@ -2977,12 +3012,23 @@ INDEX_HTML = r"""<!doctype html>
 <body>
 <main>
   <div class="topbar">
-    <nav class="timeframes" aria-label="Timeframes">
-      <button class="tf" type="button" data-interval="1m">1 minute</button>
-      <button class="tf" type="button" data-interval="5m">5 minutes</button>
-      <button class="tf" type="button" data-interval="15m">15 minutes</button>
-      <button class="tf active" type="button" data-interval="30m">30 minutes</button>
-    </nav>
+    <div class="topbar-left">
+      <a class="app-logo" href="/" aria-label="StockRadar home">
+        <span class="app-logo-mark">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M3 17 L9 10 L13 14 L21 5" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M15 5 H21 V11" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </span>
+        <span class="app-logo-text">Stock<span>Radar</span></span>
+      </a>
+      <nav class="timeframes" aria-label="Timeframes">
+        <button class="tf" type="button" data-interval="1m">1 minute</button>
+        <button class="tf" type="button" data-interval="5m">5 minutes</button>
+        <button class="tf" type="button" data-interval="15m">15 minutes</button>
+        <button class="tf active" type="button" data-interval="30m">30 minutes</button>
+      </nav>
+    </div>
     <form class="symbol-form" id="controls">
       <div class="search-combobox">
         <div class="search-shell">
