@@ -1913,10 +1913,10 @@ LOGIN_HTML = r"""<!doctype html>
       padding: 24px;
     }
     .shell {
-      width: min(920px, 100%);
+      width: min(900px, 100%);
       display: grid;
       grid-template-columns: 1fr 1fr;
-      min-height: 570px;
+      min-height: 500px;
       border-radius: 22px;
       background: #fff;
       box-shadow: 0 34px 90px rgba(28, 39, 69, .18);
