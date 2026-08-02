@@ -2021,13 +2021,16 @@ LOGIN_HTML = r"""<!doctype html>
     }
     .ticker strong { color: #f4f7ff; }
     .ticker .up { color: #19c37d; }
-    }
     .panel {
-      padding: clamp(42px, 6vw, 62px);
+      padding: clamp(48px, 6vw, 64px);
       display: flex;
       flex-direction: column;
       justify-content: center;
       background: #fff;
+    }
+    .login-card {
+      width: min(460px, 100%);
+      margin: 0 auto;
     }
     .eyebrow {
       margin: 0 0 14px;
@@ -2133,11 +2136,21 @@ LOGIN_HTML = r"""<!doctype html>
       cursor: pointer;
       box-shadow: 0 16px 28px rgba(64, 114, 242, .28);
       transition: transform .16s, box-shadow .16s;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+    }
+    button svg {
+      width: 18px;
+      height: 18px;
+      transition: transform .16s;
     }
     button:hover {
       transform: translateY(-1px);
       box-shadow: 0 20px 34px rgba(64, 114, 242, .32);
     }
+    button:hover svg { transform: translateX(2px); }
     .setup, .error {
       border-radius: 10px;
       padding: 12px 14px;
@@ -2168,14 +2181,14 @@ LOGIN_HTML = r"""<!doctype html>
     @media (max-width: 860px) {
       .shell { grid-template-columns: 1fr; }
       .brand { min-height: 560px; padding: 34px; }
-      .panel { padding: 34px; }
+      .panel { padding: 38px 34px; }
       .scanner { width: min(340px, 92%); }
     }
     @media (max-width: 520px) {
       body { padding: 14px; }
       .shell { border-radius: 18px; }
       .brand { min-height: 480px; padding: 28px 24px; }
-      .panel { padding: 30px 22px; }
+      .panel { padding: 32px 22px; }
       .row { align-items: flex-start; flex-direction: column; }
     }
   </style>
@@ -2232,40 +2245,47 @@ LOGIN_HTML = r"""<!doctype html>
       </div>
     </section>
     <section class="panel">
-      <p class="eyebrow">Private Session</p>
-      <h2>Sign in to StockRadar</h2>
-      <p class="sub">Enter your credentials to access your dashboard.</p>
-      <!--ERROR-->
-      <form method="post" action="/login">
-        <label for="username">Username</label>
-        <div class="field">
-          <span class="field-icon" aria-hidden="true">
-            <svg viewBox="0 0 24 24" fill="none">
-              <path d="M20 21a8 8 0 0 0-16 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-              <circle cx="12" cy="8" r="4" fill="currentColor"/>
+      <div class="login-card">
+        <p class="eyebrow">Private Session</p>
+        <h2>Sign in to StockRadar</h2>
+        <p class="sub">Enter your credentials to access your dashboard.</p>
+        <!--ERROR-->
+        <form method="post" action="/login">
+          <label for="username">Username</label>
+          <div class="field">
+            <span class="field-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none">
+                <path d="M20 21a8 8 0 0 0-16 0" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                <circle cx="12" cy="8" r="4" fill="currentColor"/>
+              </svg>
+            </span>
+            <input id="username" name="username" value=""" + html.escape(app_username()) + r""" autocomplete="username" required>
+          </div>
+          <label for="password">Password</label>
+          <div class="field">
+            <span class="field-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none">
+                <rect x="5" y="10" width="14" height="10" rx="2" fill="currentColor" opacity=".18"/>
+                <path d="M8 10V7a4 4 0 0 1 8 0v3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                <path d="M12 14v3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+              </svg>
+            </span>
+            <input id="password" name="password" type="password" autocomplete="current-password" required>
+          </div>
+          <div class="row">
+            <label class="remember"><input type="checkbox" name="remember">Remember this device</label>
+            <span class="security-note">Secure session</span>
+          </div>
+          <button type="submit">
+            <span>Enter dashboard</span>
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M5 12h14M13 6l6 6-6 6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
             </svg>
-          </span>
-          <input id="username" name="username" value=""" + html.escape(app_username()) + r""" autocomplete="username" required>
-        </div>
-        <label for="password">Password</label>
-        <div class="field">
-          <span class="field-icon" aria-hidden="true">
-            <svg viewBox="0 0 24 24" fill="none">
-              <rect x="5" y="10" width="14" height="10" rx="2" fill="currentColor" opacity=".18"/>
-              <path d="M8 10V7a4 4 0 0 1 8 0v3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-              <path d="M12 14v3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-            </svg>
-          </span>
-          <input id="password" name="password" type="password" autocomplete="current-password" required>
-        </div>
-        <div class="row">
-          <label class="remember"><input type="checkbox" name="remember">Remember this device</label>
-          <span class="security-note">Secure session</span>
-        </div>
-        <button type="submit">Enter dashboard -></button>
-      </form>
-      <p class="foot">Set <code>APP_USERNAME</code>, <code>APP_PASSWORD</code>, and <code>APP_SESSION_SECRET</code> before public deployment.</p>
-      """ + ("" if auth_configured() else "<p class='setup'>APP_PASSWORD is not set. Login is disabled until you configure it.</p>") + r"""
+          </button>
+        </form>
+        <p class="foot">Set <code>APP_USERNAME</code>, <code>APP_PASSWORD</code>, and <code>APP_SESSION_SECRET</code> before public deployment.</p>
+        """ + ("" if auth_configured() else "<p class='setup'>APP_PASSWORD is not set. Login is disabled until you configure it.</p>") + r"""
+      </div>
     </section>
   </main>
 </body>
