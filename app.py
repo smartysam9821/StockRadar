@@ -1916,7 +1916,7 @@ LOGIN_HTML = r"""<!doctype html>
       width: min(900px, 100%);
       display: grid;
       grid-template-columns: 1fr 1fr;
-      min-height: 500px;
+      min-height: 550px;
       border-radius: 22px;
       background: #fff;
       box-shadow: 0 34px 90px rgba(28, 39, 69, .18);
