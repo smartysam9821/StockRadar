@@ -418,6 +418,7 @@ def fetch_kite_ohlcv(symbol: str, interval: str = "5m", range_: str = "2y") -> p
 
         df = pd.concat(chunks, ignore_index=True).drop_duplicates(subset=["Date"]).sort_values("Date")
         df = df.reset_index(drop=True)
+        df = completed_regular_session_candles(df, interval)
         log_event(
             "kite.ohlcv.success",
             symbol=f"{exchange}:{tradingsymbol}",
@@ -438,6 +439,24 @@ def fetch_kite_ohlcv(symbol: str, interval: str = "5m", range_: str = "2y") -> p
             duration_ms=int((time.perf_counter() - started) * 1000),
         )
         raise
+
+
+def fetch_kite_last_price(symbol: str) -> float | None:
+    exchange, tradingsymbol = normalize_kite_symbol(symbol)
+    quote_key = f"{exchange}:{tradingsymbol}"
+    kite = kite_client()
+    try:
+        quote = kite.quote(quote_key).get(quote_key, {})
+        if quote.get("last_price") is not None:
+            return float(quote["last_price"])
+    except Exception:
+        pass
+    try:
+        ltp = kite.ltp(quote_key)
+        return float(ltp[quote_key]["last_price"])
+    except Exception as exc:
+        log_event("kite.ltp.error", "warning", symbol=quote_key, error=str(exc))
+        return None
 
 
 def current_kite_access_token() -> str:
@@ -552,6 +571,36 @@ def kite_date_window(interval: str, requested_range: str) -> tuple[datetime, dat
     }
     days = minimum_days.get(interval, 120)
     return to_dt - timedelta(days=days), to_dt
+
+
+def interval_minutes(interval: str) -> int:
+    return {"5m": 5, "15m": 15}.get(interval, 0)
+
+
+def completed_regular_session_candles(df: pd.DataFrame, interval: str) -> pd.DataFrame:
+    minutes = interval_minutes(interval)
+    if df.empty or minutes <= 0:
+        return df
+    now = datetime.now().replace(microsecond=0)
+    dates = pd.to_datetime(df["Date"], errors="coerce")
+    times = dates.dt.time
+    regular_session = (times >= datetime.strptime("09:15", "%H:%M").time()) & (
+        times < datetime.strptime("15:30", "%H:%M").time()
+    )
+    completed = dates + pd.to_timedelta(minutes, unit="m") <= now
+    filtered = df[regular_session & completed].copy()
+    if filtered.empty:
+        return df
+    dropped = len(df) - len(filtered)
+    if dropped:
+        log_event(
+            "kite.ohlcv.filter.completed_session",
+            interval=interval,
+            dropped=dropped,
+            last_input=str(df["Date"].iloc[-1]),
+            last_output=str(filtered["Date"].iloc[-1]),
+        )
+    return filtered.reset_index(drop=True)
 
 
 def fetch_kite_historical_chunks(
@@ -1223,6 +1272,7 @@ def evaluate_and_store_rating_signal(
         raise ValueError("HTTP CSV loading is disabled. Use CLI CSV mode or set APP_ALLOW_HTTP_CSV=true.")
     df = load_csv(csv_path) if csv_path else fetch_kite_ohlcv(symbol, interval, range_)
     result = technical_ratings(df, symbol=symbol)
+    display_price = None if csv_path else fetch_kite_last_price(symbol)
     local_event_stored = store_local_strong_event(result, interval, len(df))
     confirmation = maybe_confirm_extreme_with_tradingview(result, interval)
     tv_event_stored = store_confirmed_event(result, interval, len(df), confirmation)
@@ -1230,6 +1280,7 @@ def evaluate_and_store_rating_signal(
     payload = {
         "result": result,
         "bars": len(df),
+        "display_price": result.price if display_price is None else display_price,
         "confirmation": confirmation,
         "event_stored": event_stored,
         "local_event_stored": local_event_stored,
@@ -1979,7 +2030,7 @@ class RatingsHandler(BaseHTTPRequestHandler):
             self._send_json(
                 {
                     "ok": True,
-                    "data": result_to_dict(result),
+                    "data": {**result_to_dict(result), "display_price": evaluated["display_price"]},
                     "bars": evaluated["bars"],
                     "confirmation": confirmation,
                     "event_stored": event_stored,
@@ -3849,8 +3900,9 @@ function render(data, bars, confirmation) {
   setCounts("summary", summaryCounts);
   setCounts("ma", maCounts);
 
+  const lastPrice = data.display_price ?? data.price;
   document.getElementById("meta").textContent =
-    `${data.symbol} | ${activeInterval} | Last price ${data.price.toFixed(2)} | ${bars ?? "--"} bars`;
+    `${data.symbol} | ${activeInterval} | Last price ${Number(lastPrice).toFixed(2)} | ${bars ?? "--"} bars`;
   renderConfirmation(confirmation);
   renderRows("oscRows", data.oscillators, data.indicator_values);
   renderRows("maRows", data.moving_averages, data.indicator_values);
