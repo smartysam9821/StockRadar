@@ -136,7 +136,7 @@ def technical_ratings(df: pd.DataFrame, symbol: str = "") -> RatingResult:
 
     ma_score = _mean_signal(ma_signals)
     oscillator_score = _mean_signal(osc_signals)
-    overall_score = _mean_signal({**ma_signals, **osc_signals})
+    overall_score = float(np.mean([ma_score, oscillator_score]))
 
     return RatingResult(
         symbol=symbol,
