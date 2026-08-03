@@ -73,7 +73,7 @@ KITE_ACCESS_TOKEN=your_daily_access_token
 ## CLI
 
 ```powershell
-python app.py --cli --symbol ASIANPAINT.NS --interval 5m --range 2y
+python app.py --cli --symbol "NIFTY 50" --interval 5m --range 2y
 ```
 
 Print Kite login URL:
@@ -146,7 +146,7 @@ Add these settings to `.env`:
 
 ```env
 BACKGROUND_SIGNAL_SCANNER_ENABLED=true
-BACKGROUND_SIGNAL_SCANNER_SYMBOLS=ASIANPAINT.NS,NIFTY 50
+BACKGROUND_SIGNAL_SCANNER_SYMBOLS=NIFTY 50,ASIANPAINT.NS
 BACKGROUND_SIGNAL_SCANNER_INTERVALS=5m,15m
 BACKGROUND_SIGNAL_SCANNER_RANGE=2y
 BACKGROUND_SIGNAL_SCANNER_POLL_SECONDS=60
@@ -199,14 +199,12 @@ Set `DATABASE_URL` to enable PostgreSQL event logging:
 DATABASE_URL=postgresql://user:password@host:5432/database
 ```
 
-On startup, StockRadar creates the `events` table if it does not exist. A row is inserted only when:
+On startup, StockRadar creates the `events` table if it does not exist. Rows are inserted for two event sources:
 
-- all three local gauges are on the same side,
-- TradingView is checked,
-- TradingView returns all three groups as `STRONG_BUY` or all three as `STRONG_SELL`,
-- the confirmed strong signal is applied to the UI.
+- `local_unanimous_strong`: Oscillators, Summary, and Moving Averages are all locally `Strong Buy` or all locally `Strong Sell`.
+- `tradingview_confirmation`: all three local gauges are on the same buy/sell side, TradingView is checked, and TradingView returns all three groups as `STRONG_BUY` or all three as `STRONG_SELL`.
 
-The event row includes symbol, timeframe, signal, price, bars, local scores/labels, TradingView recommendations/counts, payload JSON, and request id.
+The event row includes symbol, timeframe, signal, event source, price, bars, local scores/labels, TradingView recommendations/counts when checked, payload JSON, and request id.
 
 ## Daily Option OI Baseline
 
@@ -234,6 +232,7 @@ How it works:
 - It stores `trade_date`, contract, expiry, strike, option type, OI, last price, and source in `option_oi_daily` with source `kite.quote.opening`.
 - The option-chain screen calculates `Change in OI` as `current Kite OI - latest saved Kite OI baseline`.
 - If no Kite baseline exists for a contract, `Change in OI` is shown as `0` instead of comparing against another data source.
+- If the server or Kite token was not available at the scheduled capture time, open Option Chain and click `Capture OI Baseline` to seed the selected symbol/expiry from the current Kite quote snapshot.
 
 Change `OI_BASELINE_UNDERLYINGS` if the NIFTY 50 constituents change or if you want a smaller watchlist. This requires `DATABASE_URL`, a valid Kite session, and the app process running at or after the capture time.
 

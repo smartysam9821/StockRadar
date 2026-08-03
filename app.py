@@ -37,7 +37,7 @@ except ImportError:  # Optional production confirmation layer.
 from technical_ratings import RatingResult, technical_ratings
 
 
-DEFAULT_SYMBOL = "ASIANPAINT.NS"
+DEFAULT_SYMBOL = "NIFTY 50"
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env"
 
@@ -755,6 +755,7 @@ def fetch_option_chain(symbol: str, expiry: str = "", strikes_each_side: int = 8
     keys = [f"NFO:{symbol}" for symbol in all_symbols]
     quotes = kite_quote_snapshot(keys)
     totals = full_expiry_option_totals(expiry_chain, previous_oi, quotes)
+    baseline_contracts = len(previous_oi)
     by_strike: dict[float, dict] = {}
     for row in chain.itertuples():
         strike_row = by_strike.setdefault(float(row.strike), {"strike": float(row.strike)})
@@ -772,6 +773,12 @@ def fetch_option_chain(symbol: str, expiry: str = "", strikes_each_side: int = 8
         "expiry": selected_expiry.isoformat(),
         "expiries": [item.isoformat() for item in future_expiries[:12]],
         "totals": totals,
+        "oi_baseline": {
+            "ready": baseline_contracts > 0,
+            "source": "kite.quote",
+            "contracts": baseline_contracts,
+            "missing_contracts": max(0, len(all_symbols) - baseline_contracts),
+        },
         "rows": rows,
     }
     log_event(
@@ -780,6 +787,7 @@ def fetch_option_chain(symbol: str, expiry: str = "", strikes_each_side: int = 8
         expiry=selected_expiry.isoformat(),
         spot=spot,
         strikes=len(rows),
+        oi_baseline_contracts=baseline_contracts,
         duration_ms=int((time.perf_counter() - started) * 1000),
     )
     return payload
@@ -941,6 +949,7 @@ def ensure_events_table() -> bool:
                             symbol TEXT NOT NULL,
                             interval TEXT NOT NULL,
                             signal TEXT NOT NULL CHECK (signal IN ('STRONG_BUY', 'STRONG_SELL')),
+                            event_source TEXT NOT NULL DEFAULT 'tradingview_confirmation',
                             price DOUBLE PRECISION,
                             bars INTEGER,
                             overall_score DOUBLE PRECISION,
@@ -968,6 +977,18 @@ def ensure_events_table() -> bool:
                         """
                         CREATE INDEX IF NOT EXISTS idx_events_signal_created
                         ON events (signal, created_at DESC)
+                        """
+                    )
+                    cur.execute(
+                        """
+                        ALTER TABLE events
+                        ADD COLUMN IF NOT EXISTS event_source TEXT NOT NULL DEFAULT 'tradingview_confirmation'
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_events_source_created
+                        ON events (event_source, created_at DESC)
                         """
                     )
                     cur.execute(
@@ -1030,15 +1051,19 @@ def ensure_events_table() -> bool:
             return False
 
 
-def store_confirmed_event(result: RatingResult, interval: str, bars: int, tv: dict) -> bool:
-    if not tv.get("applied") or not ensure_events_table():
+def insert_signal_event(
+    result: RatingResult,
+    interval: str,
+    bars: int,
+    *,
+    signal: str,
+    event_source: str,
+    tv: dict,
+    payload: dict,
+) -> bool:
+    if not ensure_events_table():
         return False
-    signal = "STRONG_BUY" if tv.get("summary") == "STRONG_BUY" else "STRONG_SELL"
     started = time.perf_counter()
-    payload = {
-        "local": result_to_dict(result),
-        "tradingview": tv,
-    }
     try:
         with db_connect() as conn:
             with conn.cursor() as cur:
@@ -1049,6 +1074,7 @@ def store_confirmed_event(result: RatingResult, interval: str, bars: int, tv: di
                         symbol,
                         interval,
                         signal,
+                        event_source,
                         price,
                         bars,
                         overall_score,
@@ -1069,6 +1095,7 @@ def store_confirmed_event(result: RatingResult, interval: str, bars: int, tv: di
                         %(symbol)s,
                         %(interval)s,
                         %(signal)s,
+                        %(event_source)s,
                         %(price)s,
                         %(bars)s,
                         %(overall_score)s,
@@ -1090,6 +1117,7 @@ def store_confirmed_event(result: RatingResult, interval: str, bars: int, tv: di
                         "symbol": result.symbol,
                         "interval": interval,
                         "signal": signal,
+                        "event_source": event_source,
                         "price": result.price,
                         "bars": bars,
                         "overall_score": result.overall_score,
@@ -1111,6 +1139,7 @@ def store_confirmed_event(result: RatingResult, interval: str, bars: int, tv: di
             symbol=result.symbol,
             interval=interval,
             signal=signal,
+            event_source=event_source,
             duration_ms=int((time.perf_counter() - started) * 1000),
         )
         return True
@@ -1121,10 +1150,61 @@ def store_confirmed_event(result: RatingResult, interval: str, bars: int, tv: di
             symbol=result.symbol,
             interval=interval,
             signal=signal,
+            event_source=event_source,
             error=str(exc),
             duration_ms=int((time.perf_counter() - started) * 1000),
         )
         return False
+
+
+def store_confirmed_event(result: RatingResult, interval: str, bars: int, tv: dict) -> bool:
+    if not tv.get("applied"):
+        return False
+    signal = "STRONG_BUY" if tv.get("summary") == "STRONG_BUY" else "STRONG_SELL"
+    payload = {
+        "local": result_to_dict(result),
+        "tradingview": tv,
+        "event_source": "tradingview_confirmation",
+    }
+    return insert_signal_event(
+        result,
+        interval,
+        bars,
+        signal=signal,
+        event_source="tradingview_confirmation",
+        tv=tv,
+        payload=payload,
+    )
+
+
+def store_local_strong_event(result: RatingResult, interval: str, bars: int) -> bool:
+    local_side = local_unanimous_strong_side(result)
+    if not local_side:
+        return False
+    signal = "STRONG_BUY" if local_side == "buy" else "STRONG_SELL"
+    tv = {
+        "summary": "LOCAL_ONLY",
+        "oscillators": "LOCAL_ONLY",
+        "moving_averages": "LOCAL_ONLY",
+        "cache": "not_checked",
+        "counts": {},
+        "checked": False,
+        "applied": False,
+    }
+    payload = {
+        "local": result_to_dict(result),
+        "tradingview": tv,
+        "event_source": "local_unanimous_strong",
+    }
+    return insert_signal_event(
+        result,
+        interval,
+        bars,
+        signal=signal,
+        event_source="local_unanimous_strong",
+        tv=tv,
+        payload=payload,
+    )
 
 
 def evaluate_and_store_rating_signal(
@@ -1143,13 +1223,17 @@ def evaluate_and_store_rating_signal(
         raise ValueError("HTTP CSV loading is disabled. Use CLI CSV mode or set APP_ALLOW_HTTP_CSV=true.")
     df = load_csv(csv_path) if csv_path else fetch_kite_ohlcv(symbol, interval, range_)
     result = technical_ratings(df, symbol=symbol)
+    local_event_stored = store_local_strong_event(result, interval, len(df))
     confirmation = maybe_confirm_extreme_with_tradingview(result, interval)
-    event_stored = store_confirmed_event(result, interval, len(df), confirmation)
+    tv_event_stored = store_confirmed_event(result, interval, len(df), confirmation)
+    event_stored = local_event_stored or tv_event_stored
     payload = {
         "result": result,
         "bars": len(df),
         "confirmation": confirmation,
         "event_stored": event_stored,
+        "local_event_stored": local_event_stored,
+        "tv_event_stored": tv_event_stored,
         "duration_ms": int((time.perf_counter() - started) * 1000),
     }
     log_event(
@@ -1164,6 +1248,8 @@ def evaluate_and_store_rating_signal(
         confirmation_checked=confirmation.get("checked", False),
         confirmation_applied=confirmation.get("applied", False),
         event_stored=event_stored,
+        local_event_stored=local_event_stored,
+        tv_event_stored=tv_event_stored,
         duration_ms=payload["duration_ms"],
     )
     return payload
@@ -1261,21 +1347,13 @@ def save_option_oi_rows(rows: list[dict], trade_date: object, started: float) ->
     return len(rows)
 
 
-def kite_option_oi_rows(trade_date: object) -> list[dict]:
-    instruments = load_kite_instruments()
-    allowed_underlyings = oi_baseline_underlyings()
-    today = pd.to_datetime(trade_date).date()
-    options = instruments[
-        (instruments["exchange"].astype(str).str.upper() == "NFO")
-        & (instruments["name"].astype(str).str.upper().isin(allowed_underlyings))
-        & (instruments["instrument_type"].astype(str).str.upper().isin(["CE", "PE"]))
-    ].copy()
+def kite_option_rows_from_quotes(options: pd.DataFrame, trade_date: object, source: str) -> list[dict]:
     if options.empty:
         return []
 
     options["expiry"] = pd.to_datetime(options["expiry"], errors="coerce").dt.date
     options["strike"] = pd.to_numeric(options["strike"], errors="coerce")
-    options = options[(options["expiry"].notna()) & (options["expiry"] >= today) & (options["strike"].notna())]
+    options = options[(options["expiry"].notna()) & (options["strike"].notna())]
     keys = [f"NFO:{row.tradingsymbol}" for row in options.itertuples()]
     quotes = kite_quote_snapshot(keys)
 
@@ -1296,10 +1374,49 @@ def kite_option_oi_rows(trade_date: object) -> list[dict]:
                 "option_type": str(row.instrument_type).upper(),
                 "oi": int(oi),
                 "last_price": None if pd.isna(last_price) else float(last_price),
-                "source": "kite.quote.opening",
+                "source": source,
             }
         )
     return rows
+
+
+def kite_option_oi_rows(trade_date: object) -> list[dict]:
+    instruments = load_kite_instruments()
+    allowed_underlyings = oi_baseline_underlyings()
+    today = pd.to_datetime(trade_date).date()
+    options = instruments[
+        (instruments["exchange"].astype(str).str.upper() == "NFO")
+        & (instruments["name"].astype(str).str.upper().isin(allowed_underlyings))
+        & (instruments["instrument_type"].astype(str).str.upper().isin(["CE", "PE"]))
+    ].copy()
+    options["expiry"] = pd.to_datetime(options["expiry"], errors="coerce").dt.date
+    options = options[options["expiry"].notna() & (options["expiry"] >= today)]
+    return kite_option_rows_from_quotes(options, trade_date, "kite.quote.opening")
+
+
+def kite_option_oi_rows_for_chain(symbol: str, expiry: str, trade_date: object) -> tuple[list[dict], str, object]:
+    symbol = validate_symbol(symbol)
+    _, underlying = normalize_kite_symbol(symbol)
+    option_underlying = option_underlying_symbol(underlying)
+    instruments = load_kite_instruments()
+    options = instruments[
+        (instruments["exchange"].astype(str).str.upper() == "NFO")
+        & (instruments["name"].astype(str).str.upper() == option_underlying)
+        & (instruments["instrument_type"].astype(str).str.upper().isin(["CE", "PE"]))
+    ].copy()
+    if options.empty:
+        raise ValueError(f"No NFO options found for {underlying}.")
+    options["expiry"] = pd.to_datetime(options["expiry"], errors="coerce").dt.date
+    today = pd.to_datetime(trade_date).date()
+    expiries = sorted(item for item in options["expiry"].dropna().unique() if item >= today)
+    if not expiries:
+        raise ValueError(f"No active option expiries found for {underlying}.")
+    selected_expiry = pd.to_datetime(expiry).date() if expiry else expiries[0]
+    if selected_expiry not in expiries:
+        selected_expiry = expiries[0]
+    selected = options[options["expiry"] == selected_expiry].copy()
+    rows = kite_option_rows_from_quotes(selected, trade_date, "kite.quote.manual")
+    return rows, option_underlying, selected_expiry
 
 
 def save_kite_option_oi_baseline(trade_date: object) -> int:
@@ -1315,6 +1432,30 @@ def save_kite_option_oi_baseline(trade_date: object) -> int:
         underlyings=len({row["underlying"] for row in rows}),
     )
     return save_option_oi_rows(rows, trade_date, started)
+
+
+def save_kite_option_oi_baseline_for_chain(symbol: str, expiry: str = "") -> dict:
+    if not ensure_events_table():
+        return {"rows": 0, "symbol": validate_symbol(symbol), "expiry": expiry, "source": "kite.quote.manual"}
+    started = time.perf_counter()
+    trade_date = datetime.now().date()
+    rows, option_underlying, selected_expiry = kite_option_oi_rows_for_chain(symbol, expiry, trade_date)
+    log_event(
+        "option_oi_baseline.manual_capture.start",
+        trade_date=str(trade_date),
+        symbol=option_underlying,
+        expiry=str(selected_expiry),
+        source="kite.quote.manual",
+        rows=len(rows),
+    )
+    saved = save_option_oi_rows(rows, trade_date, started)
+    return {
+        "rows": saved,
+        "symbol": option_underlying,
+        "expiry": selected_expiry.isoformat(),
+        "source": "kite.quote.manual",
+        "trade_date": trade_date.isoformat(),
+    }
 
 
 def save_latest_option_oi_baseline(max_trade_date: object | None = None) -> int:
@@ -1512,6 +1653,15 @@ def local_extreme_side(result: RatingResult) -> str:
     labels = [result.oscillator_label, result.overall_label, result.ma_label]
     sides = {label_side(label) for label in labels}
     return sides.pop() if len(sides) == 1 and sides <= {"sell", "buy"} else ""
+
+
+def local_unanimous_strong_side(result: RatingResult) -> str:
+    labels = {result.oscillator_label.lower(), result.overall_label.lower(), result.ma_label.lower()}
+    if labels == {"strong sell"}:
+        return "sell"
+    if labels == {"strong buy"}:
+        return "buy"
+    return ""
 
 
 def label_side(label: str) -> str:
@@ -1725,21 +1875,29 @@ class RatingsHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         self._begin_request("POST", parsed)
         try:
-            if parsed.path != "/login":
+            if parsed.path == "/login":
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                body = self.rfile.read(length).decode("utf-8")
+                data = urllib.parse.parse_qs(body)
+                username = data.get("username", [""])[0]
+                password = data.get("password", [""])[0]
+                remember = data.get("remember", [""])[0] == "on"
+                if auth_configured() and username == app_username() and hmac.compare_digest(password, app_password()):
+                    log_event("auth.login.success", username=username, remember=remember)
+                    self._set_session(username, remember=remember)
+                else:
+                    log_event("auth.login.failure", "warning", username=username, auth_configured=auth_configured())
+                    self._send_html(LOGIN_HTML.replace("<!--ERROR-->", "<p class='error'>Invalid login or APP_PASSWORD is not set.</p>"), status=401)
+                return
+            if not self._is_authenticated():
+                self._send_json({"ok": False, "error": "Authentication required"}, status=401)
+                return
+            if parsed.path == "/api/option-oi-baseline/capture":
+                self._handle_option_oi_baseline_capture(parsed.query)
+                return
+            else:
                 self.send_error(404, "Not found")
                 return
-            length = int(self.headers.get("Content-Length", "0") or 0)
-            body = self.rfile.read(length).decode("utf-8")
-            data = urllib.parse.parse_qs(body)
-            username = data.get("username", [""])[0]
-            password = data.get("password", [""])[0]
-            remember = data.get("remember", [""])[0] == "on"
-            if auth_configured() and username == app_username() and hmac.compare_digest(password, app_password()):
-                log_event("auth.login.success", username=username, remember=remember)
-                self._set_session(username, remember=remember)
-            else:
-                log_event("auth.login.failure", "warning", username=username, auth_configured=auth_configured())
-                self._send_html(LOGIN_HTML.replace("<!--ERROR-->", "<p class='error'>Invalid login or APP_PASSWORD is not set.</p>"), status=401)
         except Exception as exc:
             log_event("request.unhandled_error", "error", method="POST", path=parsed.path, error=str(exc))
             self._send_html(safe_error_html("Internal server error", "Request failed."), status=500)
@@ -1814,6 +1972,8 @@ class RatingsHandler(BaseHTTPRequestHandler):
                 confirmation_checked=confirmation.get("checked", False),
                 confirmation_applied=confirmation.get("applied", False),
                 event_stored=event_stored,
+                local_event_stored=evaluated["local_event_stored"],
+                tv_event_stored=evaluated["tv_event_stored"],
                 duration_ms=int((time.perf_counter() - started) * 1000),
             )
             self._send_json(
@@ -1823,6 +1983,8 @@ class RatingsHandler(BaseHTTPRequestHandler):
                     "bars": evaluated["bars"],
                     "confirmation": confirmation,
                     "event_stored": event_stored,
+                    "local_event_stored": evaluated["local_event_stored"],
+                    "tv_event_stored": evaluated["tv_event_stored"],
                 }
             )
         except ValueError as exc:
@@ -1868,6 +2030,44 @@ class RatingsHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": str(exc)}, status=400)
         except Exception as exc:
             log_event("option_chain.request.error", "error", symbol=symbol, error=str(exc), duration_ms=int((time.perf_counter() - started) * 1000))
+            self._send_json({"ok": False, "error": str(exc)}, status=500)
+
+    def _handle_option_oi_baseline_capture(self, query: str) -> None:
+        started = time.perf_counter()
+        params = urllib.parse.parse_qs(query)
+        symbol = params.get("symbol", [DEFAULT_SYMBOL])[0]
+        expiry = params.get("expiry", [""])[0].strip()
+        log_event("option_oi_baseline.manual_request.start", symbol=symbol, expiry=expiry or "nearest")
+        try:
+            result = save_kite_option_oi_baseline_for_chain(symbol, expiry)
+            log_event(
+                "option_oi_baseline.manual_request.success",
+                symbol=result.get("symbol"),
+                expiry=result.get("expiry"),
+                rows=result.get("rows"),
+                source=result.get("source"),
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
+            self._send_json({"ok": True, "data": result})
+        except ValueError as exc:
+            log_event(
+                "option_oi_baseline.manual_request.error",
+                "warning",
+                symbol=symbol,
+                expiry=expiry or "nearest",
+                error=str(exc),
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
+            self._send_json({"ok": False, "error": str(exc)}, status=400)
+        except Exception as exc:
+            log_event(
+                "option_oi_baseline.manual_request.error",
+                "error",
+                symbol=symbol,
+                expiry=expiry or "nearest",
+                error=str(exc),
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
             self._send_json({"ok": False, "error": str(exc)}, status=500)
 
     def _handle_symbols(self, query: str) -> None:
@@ -3012,6 +3212,22 @@ INDEX_HTML = r"""<!doctype html>
       outline: none;
       font-weight: 850;
     }
+    .baseline-button {
+      height: 44px;
+      border-radius: 10px;
+      border: 1px solid #cfe0ff;
+      background: #edf4ff;
+      color: #1f5fd6;
+      padding: 0 14px;
+      font: inherit;
+      font-weight: 850;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .baseline-button:disabled {
+      cursor: wait;
+      opacity: .68;
+    }
     .chain-summary {
       margin: 0 0 14px;
       color: var(--muted);
@@ -3227,7 +3443,7 @@ INDEX_HTML = r"""<!doctype html>
       <div class="search-combobox">
         <div class="search-shell">
           <span class="search-icon" aria-hidden="true"></span>
-          <input id="symbol" value="ASIANPAINT" aria-label="Search stock" autocomplete="off" spellcheck="false">
+          <input id="symbol" value="NIFTY 50" aria-label="Search stock" autocomplete="off" spellcheck="false">
         </div>
         <div class="symbol-menu" id="symbolSuggestions" role="listbox"></div>
       </div>
@@ -3302,6 +3518,7 @@ INDEX_HTML = r"""<!doctype html>
           <span>Expiry</span>
           <select id="expirySelect" aria-label="Expiry"></select>
         </label>
+        <button class="baseline-button" id="captureOiBaseline" type="button">Capture OI Baseline</button>
       </div>
     </div>
     <p class="chain-summary" id="chainMeta">Waiting for option chain</p>
@@ -3376,9 +3593,11 @@ const toggleViewButton = document.getElementById("toggleView");
 const ratingsView = document.getElementById("ratingsView");
 const chainView = document.getElementById("chainView");
 const expirySelect = document.getElementById("expirySelect");
+const captureOiBaselineButton = document.getElementById("captureOiBaseline");
 const symbolInput = document.getElementById("symbol");
 const symbolSuggestions = document.getElementById("symbolSuggestions");
 const autoRefreshSelect = document.getElementById("autoRefresh");
+const SYMBOL_STORAGE_KEY = "stockradar.selectedSymbol";
 let activeInterval = "5m";
 let activeView = "ratings";
 let symbolTimer = 0;
@@ -3387,6 +3606,27 @@ let refreshInFlight = false;
 let symbolResults = [];
 let activeSymbolIndex = -1;
 const previousGaugeScores = {};
+
+function savedSymbol() {
+  try {
+    return localStorage.getItem(SYMBOL_STORAGE_KEY) || "";
+  } catch (error) {
+    return "";
+  }
+}
+
+function persistSymbol() {
+  const symbol = symbolInput.value.trim();
+  if (!symbol) return;
+  try {
+    localStorage.setItem(SYMBOL_STORAGE_KEY, symbol);
+  } catch (error) {
+    // Storage can be unavailable in private/locked-down browsers.
+  }
+}
+
+const initialSymbol = savedSymbol();
+if (initialSymbol) symbolInput.value = initialSymbol;
 
 function labelForSignal(value) {
   return value > 0 ? "Buy" : value < 0 ? "Sell" : "Neutral";
@@ -3619,6 +3859,7 @@ function render(data, bars, confirmation) {
 async function load() {
   if (refreshInFlight) return;
   refreshInFlight = true;
+  persistSymbol();
   document.getElementById("meta").textContent = "Loading market data...";
   try {
     const qs = new URLSearchParams({
@@ -3783,8 +4024,12 @@ function optionRows(rows, sideKey, atmStrike) {
 }
 
 function renderOptionChain(data) {
+  const baseline = data.oi_baseline || {};
+  const baselineText = baseline.ready
+    ? `Baseline ${integer(baseline.contracts)} contracts`
+    : `Baseline missing (${integer(baseline.missing_contracts || 0)} contracts)`;
   document.getElementById("chainMeta").textContent =
-    `${data.symbol} | Spot ${money(data.spot)} | Expiry ${data.expiry}`;
+    `${data.symbol} | Spot ${money(data.spot)} | Expiry ${data.expiry} | ${baselineText}`;
   document.getElementById("callTitle").textContent = `${data.option_underlying || data.symbol} Call Option`;
   document.getElementById("putTitle").textContent = `${data.option_underlying || data.symbol} Put Option`;
   const previousExpiry = expirySelect.value;
@@ -3806,6 +4051,7 @@ function renderOptionChain(data) {
 async function loadOptionChain() {
   if (refreshInFlight) return;
   refreshInFlight = true;
+  persistSymbol();
   document.getElementById("chainMeta").textContent = "Loading option chain...";
   try {
     const qs = new URLSearchParams({
@@ -3819,6 +4065,29 @@ async function loadOptionChain() {
     renderOptionChain(payload.data);
   } finally {
     refreshInFlight = false;
+  }
+}
+
+async function captureOiBaseline() {
+  if (refreshInFlight) return;
+  persistSymbol();
+  captureOiBaselineButton.disabled = true;
+  captureOiBaselineButton.textContent = "Capturing...";
+  document.getElementById("chainMeta").textContent = "Capturing Kite OI baseline...";
+  try {
+    const qs = new URLSearchParams({
+      symbol: symbolInput.value,
+      expiry: expirySelect.value
+    });
+    const response = await fetch(`/api/option-oi-baseline/capture?${qs.toString()}`, { method: "POST" });
+    const payload = await response.json();
+    if (!payload.ok) throw new Error(payload.error || "Unable to capture OI baseline");
+    document.getElementById("chainMeta").textContent =
+      `Captured ${integer(payload.data.rows)} Kite OI baseline contracts for ${payload.data.symbol} ${payload.data.expiry}`;
+    await loadOptionChain();
+  } finally {
+    captureOiBaselineButton.disabled = false;
+    captureOiBaselineButton.textContent = "Capture OI Baseline";
   }
 }
 
@@ -3891,6 +4160,7 @@ function chooseSymbol(index) {
   const item = symbolResults[index];
   if (!item) return;
   symbolInput.value = item.symbol || item.tradingsymbol;
+  persistSymbol();
   hideSymbolSuggestions();
   runCurrentRefresh();
 }
@@ -3950,6 +4220,8 @@ form.addEventListener("submit", event => {
     load().catch(showError);
   }
 });
+
+captureOiBaselineButton.addEventListener("click", () => captureOiBaseline().catch(showChainError));
 
 symbolInput.addEventListener("input", () => {
   clearTimeout(symbolTimer);
