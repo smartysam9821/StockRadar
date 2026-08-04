@@ -22,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 from kiteconnect import KiteConnect
 try:
     import psycopg
@@ -138,6 +139,7 @@ DB_LOCK = threading.RLock()
 DB_READY = False
 OI_BASELINE_THREAD_STARTED = False
 SIGNAL_SCANNER_THREAD_STARTED = False
+MOCK_STRATEGY_THREAD_STARTED = False
 TV_CONFIRMATION_LOCK = threading.RLock()
 TV_CONFIRMATION_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
 TV_INTERVALS = {
@@ -354,6 +356,77 @@ def background_signal_scanner_poll_seconds() -> int:
 
 def background_signal_scanner_delay_seconds() -> float:
     return parse_int(os.environ.get("BACKGROUND_SIGNAL_SCANNER_DELAY_SECONDS", "2"), 2, 0, 60)
+
+
+def mock_strategy_enabled() -> bool:
+    return os.environ.get("MOCK_STRATEGY_ENABLED", "false").lower() in {"1", "true", "yes"}
+
+
+def mock_strategy_symbols() -> list[str]:
+    configured = os.environ.get("MOCK_STRATEGY_SYMBOLS", "NIFTY 50").strip()
+    symbols = []
+    seen = set()
+    for item in configured.split(","):
+        raw = item.strip()
+        if not raw:
+            continue
+        try:
+            symbol = validate_symbol(raw)
+        except ValueError as exc:
+            log_event("mock_strategy.symbol.skip", "warning", symbol=raw, error=str(exc))
+            continue
+        if symbol not in seen:
+            seen.add(symbol)
+            symbols.append(symbol)
+    return symbols or ["NIFTY 50"]
+
+
+def mock_strategy_poll_seconds() -> int:
+    return parse_int(os.environ.get("MOCK_STRATEGY_POLL_SECONDS", "60"), 60, 15, 900)
+
+
+def mock_strategy_entry_after() -> tuple[int, int]:
+    value = os.environ.get("MOCK_STRATEGY_ENTRY_AFTER", "11:30").strip()
+    match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", value)
+    return (int(match.group(1)), int(match.group(2))) if match else (11, 30)
+
+
+def mock_strategy_square_off() -> tuple[int, int]:
+    value = os.environ.get("MOCK_STRATEGY_SQUARE_OFF", "15:20").strip()
+    match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", value)
+    return (int(match.group(1)), int(match.group(2))) if match else (15, 20)
+
+
+def mock_strategy_pcr_upper() -> float:
+    try:
+        return float(os.environ.get("MOCK_STRATEGY_PCR_UPPER", "1.10"))
+    except ValueError:
+        return 1.10
+
+
+def mock_strategy_pcr_lower() -> float:
+    try:
+        return float(os.environ.get("MOCK_STRATEGY_PCR_LOWER", "0.90"))
+    except ValueError:
+        return 0.90
+
+
+def mock_strategy_lot_size() -> int:
+    return parse_int(os.environ.get("MOCK_STRATEGY_LOT_SIZE", "75"), 75, 1, 10000)
+
+
+def mock_strategy_fixed_delta() -> float:
+    try:
+        return float(os.environ.get("MOCK_STRATEGY_FIXED_DELTA", "0.3"))
+    except ValueError:
+        return 0.3
+
+
+def mock_strategy_target_sl(delta: float) -> tuple[float, float, float]:
+    buckets = {0.3: (30.0, 20.0), 0.4: (40.0, 25.0), 0.5: (50.0, 30.0)}
+    bucket = min(buckets, key=lambda item: abs(item - delta))
+    target, sl = buckets[bucket]
+    return bucket, target, sl
 
 
 def safe_error_html(title: str, message: object) -> str:
@@ -1078,6 +1151,76 @@ def ensure_events_table() -> bool:
                     )
                     cur.execute(
                         """
+                        CREATE TABLE IF NOT EXISTS mock_strategy_positions (
+                            position_id TEXT PRIMARY KEY,
+                            trade_date DATE NOT NULL,
+                            symbol TEXT NOT NULL,
+                            expiry DATE NOT NULL,
+                            strike DOUBLE PRECISION NOT NULL,
+                            option_type TEXT NOT NULL CHECK (option_type IN ('CE', 'PE')),
+                            entry_time TIMESTAMPTZ NOT NULL,
+                            entry_premium DOUBLE PRECISION NOT NULL,
+                            delta_at_entry DOUBLE PRECISION NOT NULL,
+                            delta_bucket DOUBLE PRECISION NOT NULL,
+                            target_pts DOUBLE PRECISION NOT NULL,
+                            sl_pts DOUBLE PRECISION NOT NULL,
+                            pcr_ratio_at_entry DOUBLE PRECISION,
+                            pcr_diff_at_entry DOUBLE PRECISION NOT NULL,
+                            n_strikes_used INTEGER NOT NULL,
+                            spot_at_entry DOUBLE PRECISION,
+                            vwap_at_entry DOUBLE PRECISION,
+                            status TEXT NOT NULL DEFAULT 'OPEN',
+                            payload JSONB
+                        )
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_mock_positions_open
+                        ON mock_strategy_positions (status, symbol, trade_date)
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS mock_strategy_trades (
+                            trade_id TEXT PRIMARY KEY,
+                            position_id TEXT,
+                            trade_date DATE NOT NULL,
+                            symbol TEXT NOT NULL,
+                            expiry DATE NOT NULL,
+                            strike DOUBLE PRECISION NOT NULL,
+                            option_type TEXT NOT NULL CHECK (option_type IN ('CE', 'PE')),
+                            entry_time TIMESTAMPTZ NOT NULL,
+                            exit_time TIMESTAMPTZ NOT NULL,
+                            entry_premium DOUBLE PRECISION NOT NULL,
+                            exit_premium DOUBLE PRECISION NOT NULL,
+                            delta_at_entry DOUBLE PRECISION NOT NULL,
+                            delta_bucket DOUBLE PRECISION NOT NULL,
+                            target_pts DOUBLE PRECISION NOT NULL,
+                            sl_pts DOUBLE PRECISION NOT NULL,
+                            exit_reason TEXT NOT NULL CHECK (exit_reason IN ('TARGET', 'SL', 'EOD', 'OTHER')),
+                            pnl_points DOUBLE PRECISION NOT NULL,
+                            pnl_amount DOUBLE PRECISION NOT NULL,
+                            pcr_ratio_at_entry DOUBLE PRECISION,
+                            pcr_diff_at_entry DOUBLE PRECISION NOT NULL,
+                            n_strikes_used INTEGER NOT NULL,
+                            spot_at_entry DOUBLE PRECISION,
+                            vwap_at_entry DOUBLE PRECISION,
+                            spot_at_exit DOUBLE PRECISION,
+                            vwap_at_exit DOUBLE PRECISION,
+                            holding_minutes DOUBLE PRECISION,
+                            payload JSONB
+                        )
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_mock_trades_symbol_date
+                        ON mock_strategy_trades (symbol, trade_date DESC)
+                        """
+                    )
+                    cur.execute(
+                        """
                         DELETE FROM option_oi_daily
                         WHERE source = 'nse.bhavcopy'
                         """
@@ -1622,6 +1765,313 @@ def start_signal_scanner_scheduler() -> None:
     thread.start()
 
 
+def mock_strategy_due_for_entries(now: datetime) -> bool:
+    if now.weekday() >= 5:
+        return False
+    entry_hour, entry_minute = mock_strategy_entry_after()
+    exit_hour, exit_minute = mock_strategy_square_off()
+    entry_time = now.replace(hour=entry_hour, minute=entry_minute, second=0, microsecond=0)
+    exit_time = now.replace(hour=exit_hour, minute=exit_minute, second=0, microsecond=0)
+    return entry_time <= now < exit_time
+
+
+def mock_strategy_due_for_squareoff(now: datetime) -> bool:
+    if now.weekday() >= 5:
+        return False
+    exit_hour, exit_minute = mock_strategy_square_off()
+    return now >= now.replace(hour=exit_hour, minute=exit_minute, second=0, microsecond=0)
+
+
+def mock_strategy_open_position(symbol: str) -> dict | None:
+    if not ensure_events_table():
+        return None
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    position_id, trade_date, symbol, expiry, strike, option_type,
+                    entry_time, entry_premium, delta_at_entry, delta_bucket,
+                    target_pts, sl_pts, pcr_ratio_at_entry, pcr_diff_at_entry,
+                    n_strikes_used, spot_at_entry, vwap_at_entry
+                FROM mock_strategy_positions
+                WHERE status = 'OPEN' AND symbol = %s AND trade_date = %s
+                ORDER BY entry_time DESC
+                LIMIT 1
+                """,
+                (symbol, datetime.now().date()),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    keys = [
+        "position_id", "trade_date", "symbol", "expiry", "strike", "option_type",
+        "entry_time", "entry_premium", "delta_at_entry", "delta_bucket",
+        "target_pts", "sl_pts", "pcr_ratio_at_entry", "pcr_diff_at_entry",
+        "n_strikes_used", "spot_at_entry", "vwap_at_entry",
+    ]
+    return dict(zip(keys, row))
+
+
+def mock_strategy_trade_count(symbol: str, trade_date: object) -> int:
+    if not ensure_events_table():
+        return 0
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM mock_strategy_trades WHERE symbol = %s AND trade_date = %s",
+                (symbol, trade_date),
+            )
+            return int(cur.fetchone()[0])
+
+
+def mock_strategy_entry_snapshot(chain: dict) -> dict | None:
+    trade_date = datetime.now().date()
+    expiry = pd.to_datetime(chain["expiry"]).date()
+    dte = max(0, (expiry - trade_date).days)
+    rows = chain.get("rows", [])
+    if not rows:
+        return None
+    spot = float(chain["spot"])
+    strikes = sorted(float(row["strike"]) for row in rows)
+    selected = set(strikes)
+    call_change = 0.0
+    put_change = 0.0
+    for row in rows:
+        call_change += float((row.get("CE") or {}).get("oi_change") or 0)
+        put_change += float((row.get("PE") or {}).get("oi_change") or 0)
+    pcr_ratio = None if call_change == 0 else put_change / call_change
+    pcr_diff = call_change - put_change
+    if pcr_ratio is not None and pcr_ratio >= mock_strategy_pcr_upper():
+        option_type = "CE"
+        bias = "BULLISH"
+    elif pcr_ratio is not None and pcr_ratio <= mock_strategy_pcr_lower():
+        option_type = "PE"
+        bias = "BEARISH"
+    elif pcr_ratio is None and pcr_diff < 0:
+        option_type = "CE"
+        bias = "BULLISH"
+    elif pcr_ratio is None and pcr_diff > 0:
+        option_type = "PE"
+        bias = "BEARISH"
+    else:
+        return None
+
+    vwap = chain.get("vwap") or spot
+    candidates = []
+    for row in rows:
+        side = row.get(option_type) or {}
+        premium = side.get("ltp")
+        if premium is None:
+            continue
+        strike = float(row["strike"])
+        candidates.append((abs(strike - float(vwap)), strike, side, row))
+    if not candidates:
+        return None
+    _, strike, side, _ = sorted(candidates, key=lambda item: (item[0], item[1]))[0]
+    delta = mock_strategy_fixed_delta()
+    bucket, target, sl = mock_strategy_target_sl(delta)
+    return {
+        "trade_date": trade_date,
+        "symbol": chain["symbol"],
+        "expiry": expiry,
+        "strike": strike,
+        "option_type": option_type,
+        "entry_premium": float(side["ltp"]),
+        "delta_at_entry": delta,
+        "delta_bucket": bucket,
+        "target_pts": target,
+        "sl_pts": sl,
+        "pcr_ratio_at_entry": pcr_ratio,
+        "pcr_diff_at_entry": pcr_diff,
+        "n_strikes_used": dte,
+        "spot_at_entry": spot,
+        "vwap_at_entry": float(vwap) if vwap is not None else None,
+        "bias": bias,
+        "selected_strikes": sorted(selected),
+    }
+
+
+def mock_strategy_insert_position(entry: dict) -> str:
+    position_id = secrets.token_hex(16)
+    now = datetime.now()
+    payload = {**entry, "expiry": entry["expiry"].isoformat(), "trade_date": entry["trade_date"].isoformat()}
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO mock_strategy_positions (
+                    position_id, trade_date, symbol, expiry, strike, option_type,
+                    entry_time, entry_premium, delta_at_entry, delta_bucket,
+                    target_pts, sl_pts, pcr_ratio_at_entry, pcr_diff_at_entry,
+                    n_strikes_used, spot_at_entry, vwap_at_entry, payload
+                )
+                VALUES (
+                    %(position_id)s, %(trade_date)s, %(symbol)s, %(expiry)s, %(strike)s, %(option_type)s,
+                    %(entry_time)s, %(entry_premium)s, %(delta_at_entry)s, %(delta_bucket)s,
+                    %(target_pts)s, %(sl_pts)s, %(pcr_ratio_at_entry)s, %(pcr_diff_at_entry)s,
+                    %(n_strikes_used)s, %(spot_at_entry)s, %(vwap_at_entry)s, %(payload)s::jsonb
+                )
+                """,
+                {
+                    **entry,
+                    "position_id": position_id,
+                    "entry_time": now,
+                    "payload": json.dumps(payload, default=str),
+                },
+            )
+    log_event(
+        "mock_strategy.position.opened",
+        position_id=position_id,
+        symbol=entry["symbol"],
+        strike=entry["strike"],
+        option_type=entry["option_type"],
+        entry_premium=entry["entry_premium"],
+        target_pts=entry["target_pts"],
+        sl_pts=entry["sl_pts"],
+        pcr_ratio=entry["pcr_ratio_at_entry"],
+        pcr_diff=entry["pcr_diff_at_entry"],
+    )
+    return position_id
+
+
+def mock_strategy_current_premium(position: dict, chain: dict) -> tuple[float | None, float | None, float | None]:
+    option_type = position["option_type"]
+    for row in chain.get("rows", []):
+        if float(row["strike"]) != float(position["strike"]):
+            continue
+        side = row.get(option_type) or {}
+        if side.get("ltp") is None:
+            return None, chain.get("spot"), chain.get("vwap")
+        return float(side["ltp"]), chain.get("spot"), chain.get("vwap")
+    return None, chain.get("spot"), chain.get("vwap")
+
+
+def mock_strategy_close_position(position: dict, exit_premium: float, reason: str, spot: float | None, vwap: float | None) -> None:
+    now = datetime.now()
+    pnl_points = float(exit_premium) - float(position["entry_premium"])
+    pnl_amount = pnl_points * mock_strategy_lot_size()
+    holding_minutes = (now - position["entry_time"].replace(tzinfo=None)).total_seconds() / 60
+    trade_id = secrets.token_hex(16)
+    payload = {**position, "trade_id": trade_id, "exit_premium": exit_premium, "exit_reason": reason}
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO mock_strategy_trades (
+                    trade_id, position_id, trade_date, symbol, expiry, strike, option_type,
+                    entry_time, exit_time, entry_premium, exit_premium, delta_at_entry,
+                    delta_bucket, target_pts, sl_pts, exit_reason, pnl_points, pnl_amount,
+                    pcr_ratio_at_entry, pcr_diff_at_entry, n_strikes_used, spot_at_entry,
+                    vwap_at_entry, spot_at_exit, vwap_at_exit, holding_minutes, payload
+                )
+                VALUES (
+                    %(trade_id)s, %(position_id)s, %(trade_date)s, %(symbol)s, %(expiry)s, %(strike)s, %(option_type)s,
+                    %(entry_time)s, %(exit_time)s, %(entry_premium)s, %(exit_premium)s, %(delta_at_entry)s,
+                    %(delta_bucket)s, %(target_pts)s, %(sl_pts)s, %(exit_reason)s, %(pnl_points)s, %(pnl_amount)s,
+                    %(pcr_ratio_at_entry)s, %(pcr_diff_at_entry)s, %(n_strikes_used)s, %(spot_at_entry)s,
+                    %(vwap_at_entry)s, %(spot_at_exit)s, %(vwap_at_exit)s, %(holding_minutes)s, %(payload)s::jsonb
+                )
+                """,
+                {
+                    **position,
+                    "trade_id": trade_id,
+                    "exit_time": now,
+                    "exit_premium": exit_premium,
+                    "exit_reason": reason,
+                    "pnl_points": pnl_points,
+                    "pnl_amount": pnl_amount,
+                    "spot_at_exit": spot,
+                    "vwap_at_exit": vwap,
+                    "holding_minutes": holding_minutes,
+                    "payload": json.dumps(payload, default=str),
+                },
+            )
+            cur.execute(
+                "UPDATE mock_strategy_positions SET status = 'CLOSED' WHERE position_id = %s",
+                (position["position_id"],),
+            )
+    log_event(
+        "mock_strategy.position.closed",
+        trade_id=trade_id,
+        position_id=position["position_id"],
+        symbol=position["symbol"],
+        exit_reason=reason,
+        exit_premium=exit_premium,
+        pnl_points=pnl_points,
+        pnl_amount=pnl_amount,
+    )
+
+
+def mock_strategy_evaluate_symbol(symbol: str) -> None:
+    now = datetime.now()
+    normalized_symbol = option_underlying_symbol(normalize_kite_symbol(symbol)[1])
+    open_position = mock_strategy_open_position(normalized_symbol)
+    chain = fetch_option_chain(symbol, strikes_each_side=25)
+    if open_position:
+        premium, spot, vwap = mock_strategy_current_premium(open_position, chain)
+        if premium is None:
+            log_event("mock_strategy.position.skip_exit", "warning", symbol=normalized_symbol, reason="premium_missing")
+            return
+        if mock_strategy_due_for_squareoff(now):
+            mock_strategy_close_position(open_position, premium, "EOD", spot, vwap)
+        elif premium >= float(open_position["entry_premium"]) + float(open_position["target_pts"]):
+            mock_strategy_close_position(open_position, premium, "TARGET", spot, vwap)
+        elif premium <= float(open_position["entry_premium"]) - float(open_position["sl_pts"]):
+            mock_strategy_close_position(open_position, premium, "SL", spot, vwap)
+        return
+
+    if not mock_strategy_due_for_entries(now):
+        return
+    if mock_strategy_trade_count(normalized_symbol, now.date()) >= 1:
+        return
+    entry = mock_strategy_entry_snapshot(chain)
+    if entry is None:
+        log_event("mock_strategy.entry.skip", symbol=normalized_symbol, reason="no_signal")
+        return
+    mock_strategy_insert_position(entry)
+
+
+def mock_strategy_loop() -> None:
+    log_event(
+        "mock_strategy.scheduler.start",
+        enabled=mock_strategy_enabled(),
+        symbols=mock_strategy_symbols(),
+        entry_after="%02d:%02d" % mock_strategy_entry_after(),
+        square_off="%02d:%02d" % mock_strategy_square_off(),
+        poll_seconds=mock_strategy_poll_seconds(),
+        fixed_delta=mock_strategy_fixed_delta(),
+        pcr_upper=mock_strategy_pcr_upper(),
+        pcr_lower=mock_strategy_pcr_lower(),
+    )
+    while True:
+        try:
+            if not mock_strategy_enabled():
+                log_event("mock_strategy.scheduler.skip", reason="disabled")
+            elif not database_enabled():
+                log_event("mock_strategy.scheduler.skip", "warning", reason="database_url_missing")
+            elif not current_kite_access_token():
+                log_event("mock_strategy.scheduler.skip", "warning", reason="kite_not_connected")
+            else:
+                for symbol in mock_strategy_symbols():
+                    try:
+                        mock_strategy_evaluate_symbol(symbol)
+                    except Exception as exc:
+                        log_event("mock_strategy.symbol.error", "error", symbol=symbol, error=str(exc))
+        except Exception as exc:
+            log_event("mock_strategy.scheduler.error", "error", error=str(exc))
+        time.sleep(mock_strategy_poll_seconds())
+
+
+def start_mock_strategy_scheduler() -> None:
+    global MOCK_STRATEGY_THREAD_STARTED
+    if MOCK_STRATEGY_THREAD_STARTED:
+        return
+    MOCK_STRATEGY_THREAD_STARTED = True
+    thread = threading.Thread(target=mock_strategy_loop, name="mock-strategy-scheduler", daemon=True)
+    thread.start()
+
+
 def maybe_confirm_extreme_with_tradingview(result: RatingResult, interval: str) -> dict:
     started = time.perf_counter()
     local_extreme = local_extreme_side(result)
@@ -1831,6 +2281,212 @@ def tv_counts(payload: dict) -> dict:
     }
 
 
+TV_VALUE_KEYS = {
+    "RSI14": "RSI",
+    "Stochastic": "Stoch.K",
+    "CCI20": "CCI20",
+    "ADX14": "ADX",
+    "AO": "AO",
+    "Momentum10": "Mom",
+    "MACD": "MACD.macd",
+    "StochRSI": "Stoch.RSI.K",
+    "WilliamsR": "W.R",
+    "BullBearPower": "BBPower",
+    "UltimateOscillator": "UO",
+    "SMA10": "SMA10",
+    "EMA10": "EMA10",
+    "SMA20": "SMA20",
+    "EMA20": "EMA20",
+    "SMA30": "SMA30",
+    "EMA30": "EMA30",
+    "SMA50": "SMA50",
+    "EMA50": "EMA50",
+    "SMA100": "SMA100",
+    "EMA100": "EMA100",
+    "SMA200": "SMA200",
+    "EMA200": "EMA200",
+    "HMA9": "HullMA9",
+    "VWMA20": "VWMA",
+    "Ichimoku": "Ichimoku.BLine",
+}
+
+
+TV_SIGNAL_KEYS = {
+    "RSI14": ("oscillators", "RSI"),
+    "Stochastic": ("oscillators", "STOCH.K"),
+    "CCI20": ("oscillators", "CCI"),
+    "ADX14": ("oscillators", "ADX"),
+    "AO": ("oscillators", "AO"),
+    "Momentum10": ("oscillators", "Mom"),
+    "MACD": ("oscillators", "MACD"),
+    "StochRSI": ("oscillators", "Stoch.RSI"),
+    "WilliamsR": ("oscillators", "W%R"),
+    "BullBearPower": ("oscillators", "BBP"),
+    "UltimateOscillator": ("oscillators", "UO"),
+    "SMA10": ("moving_averages", "SMA10"),
+    "EMA10": ("moving_averages", "EMA10"),
+    "SMA20": ("moving_averages", "SMA20"),
+    "EMA20": ("moving_averages", "EMA20"),
+    "SMA30": ("moving_averages", "SMA30"),
+    "EMA30": ("moving_averages", "EMA30"),
+    "SMA50": ("moving_averages", "SMA50"),
+    "EMA50": ("moving_averages", "EMA50"),
+    "SMA100": ("moving_averages", "SMA100"),
+    "EMA100": ("moving_averages", "EMA100"),
+    "SMA200": ("moving_averages", "SMA200"),
+    "EMA200": ("moving_averages", "EMA200"),
+    "HMA9": ("moving_averages", "HullMA"),
+    "VWMA20": ("moving_averages", "VWMA"),
+    "Ichimoku": ("moving_averages", "Ichimoku"),
+}
+
+
+OUR_VALUE_KEYS = {
+    "RSI14": "RSI14",
+    "Stochastic": "StochK",
+    "CCI20": "CCI20",
+    "ADX14": "ADX14",
+    "AO": "AO",
+    "Momentum10": "Momentum10",
+    "MACD": "MACD",
+    "StochRSI": "StochRSIK",
+    "WilliamsR": "WilliamsR",
+    "BullBearPower": "BullPower13",
+    "UltimateOscillator": "UltimateOscillator",
+    "SMA10": "SMA10",
+    "EMA10": "EMA10",
+    "SMA20": "SMA20",
+    "EMA20": "EMA20",
+    "SMA30": "SMA30",
+    "EMA30": "EMA30",
+    "SMA50": "SMA50",
+    "EMA50": "EMA50",
+    "SMA100": "SMA100",
+    "EMA100": "EMA100",
+    "SMA200": "SMA200",
+    "EMA200": "EMA200",
+    "HMA9": "HMA9",
+    "VWMA20": "VWMA20",
+    "Ichimoku": "IchimokuBase",
+}
+
+
+def signal_name(value: int | float | None) -> str:
+    if value is None:
+        return "NEUTRAL"
+    if value > 0:
+        return "BUY"
+    if value < 0:
+        return "SELL"
+    return "NEUTRAL"
+
+
+def clean_debug_number(value: object) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if np.isnan(number) or np.isinf(number):
+        return None
+    return number
+
+
+def latest_candles_payload(df: pd.DataFrame, count: int = 5) -> list[dict]:
+    rows = []
+    for row in df.tail(count).itertuples(index=False):
+        rows.append(
+            {
+                "date": str(getattr(row, "Date")),
+                "open": clean_debug_number(getattr(row, "Open")),
+                "high": clean_debug_number(getattr(row, "High")),
+                "low": clean_debug_number(getattr(row, "Low")),
+                "close": clean_debug_number(getattr(row, "Close")),
+                "volume": clean_debug_number(getattr(row, "Volume")),
+            }
+        )
+    return rows
+
+
+def fetch_tradingview_analysis(symbol: str, interval: str):
+    if TA_Handler is None or TVInterval is None:
+        raise ValueError("Install tradingview-ta to enable TradingView debug comparison.")
+    exchange, tradingsymbol = normalize_kite_symbol(symbol)
+    tv_symbol = tradingview_symbol(tradingsymbol)
+    handler = TA_Handler(
+        symbol=tv_symbol,
+        screener="india",
+        exchange=exchange,
+        interval=tradingview_interval(interval),
+        timeout=12,
+    )
+    return f"{exchange}:{tv_symbol}", handler.get_analysis()
+
+
+def debug_compare_payload(symbol: str, interval: str, range_: str) -> dict:
+    started = time.perf_counter()
+    symbol = validate_symbol(symbol)
+    interval = validate_interval(interval)
+    range_ = validate_range(range_)
+    df = fetch_kite_ohlcv(symbol, interval, range_)
+    result = technical_ratings(df, symbol=symbol)
+    tv_symbol, analysis = fetch_tradingview_analysis(symbol, interval)
+    our_values = result.indicator_values
+    comparison = {}
+    for indicator, tv_key in TV_VALUE_KEYS.items():
+        our_key = OUR_VALUE_KEYS[indicator]
+        our_value = clean_debug_number(our_values.get(our_key))
+        tv_value = clean_debug_number(analysis.indicators.get(tv_key))
+        group, signal_key = TV_SIGNAL_KEYS[indicator]
+        tv_group = analysis.oscillators if group == "oscillators" else analysis.moving_averages
+        tv_signal = normalize_tv_recommendation(tv_group.get("COMPUTE", {}).get(signal_key, "NEUTRAL"))
+        our_signal = signal_name(
+            result.oscillators.get(indicator)
+            if group == "oscillators"
+            else result.moving_averages.get(indicator)
+        )
+        comparison[indicator] = {
+            "group": group,
+            "our_value": our_value,
+            "tradingview_value": tv_value,
+            "difference": None if our_value is None or tv_value is None else our_value - tv_value,
+            "our_signal": our_signal,
+            "tradingview_signal": tv_signal,
+            "signal_match": our_signal == tv_signal,
+            "our_value_key": our_key,
+            "tradingview_value_key": tv_key,
+        }
+    payload = {
+        "symbol": symbol,
+        "tradingview_symbol": tv_symbol,
+        "interval": interval,
+        "range": range_,
+        "bars": len(df),
+        "latest_kite_candles": latest_candles_payload(df),
+        "our": result_to_dict(result),
+        "tradingview": {
+            "summary": analysis.summary,
+            "oscillators": analysis.oscillators,
+            "moving_averages": analysis.moving_averages,
+            "recommend": {
+                "summary": clean_debug_number(analysis.indicators.get("Recommend.All")),
+                "oscillators": clean_debug_number(analysis.indicators.get("Recommend.Other")),
+                "moving_averages": clean_debug_number(analysis.indicators.get("Recommend.MA")),
+            },
+        },
+        "comparison": comparison,
+        "duration_ms": int((time.perf_counter() - started) * 1000),
+    }
+    log_event(
+        "debug.compare.success",
+        symbol=symbol,
+        tradingview_symbol=tv_symbol,
+        interval=interval,
+        bars=len(df),
+        duration_ms=payload["duration_ms"],
+    )
+    return payload
+
+
 def apply_tradingview_extremes(result: RatingResult, tv: dict, side: str) -> None:
     if side == "sell" and tv.get("summary") == "STRONG_SELL":
         object.__setattr__(result, "overall_score", -1.0)
@@ -1919,6 +2575,9 @@ class RatingsHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/health":
             self._handle_health()
+            return
+        if parsed.path == "/api/debug/compare":
+            self._handle_debug_compare(parsed.query)
             return
         self.send_error(404, "Not found")
 
@@ -2156,9 +2815,54 @@ class RatingsHandler(BaseHTTPRequestHandler):
             "signal_scanner_intervals": background_signal_scanner_intervals(),
             "signal_scanner_range": background_signal_scanner_range(),
             "signal_scanner_poll_seconds": background_signal_scanner_poll_seconds(),
+            "mock_strategy_enabled": mock_strategy_enabled(),
+            "mock_strategy_thread_started": MOCK_STRATEGY_THREAD_STARTED,
+            "mock_strategy_symbols": mock_strategy_symbols(),
+            "mock_strategy_entry_after": "%02d:%02d" % mock_strategy_entry_after(),
+            "mock_strategy_square_off": "%02d:%02d" % mock_strategy_square_off(),
+            "mock_strategy_poll_seconds": mock_strategy_poll_seconds(),
+            "mock_strategy_fixed_delta": mock_strategy_fixed_delta(),
         }
         log_event("health.success", **payload)
         self._send_json(payload)
+
+    def _handle_debug_compare(self, query: str) -> None:
+        started = time.perf_counter()
+        params = urllib.parse.parse_qs(query)
+        symbol = params.get("symbol", [DEFAULT_SYMBOL])[0]
+        interval = params.get("interval", ["15m"])[0]
+        range_ = params.get("range", ["2y"])[0]
+        log_event("debug.compare.request.start", symbol=symbol, interval=interval, range=range_)
+        try:
+            payload = debug_compare_payload(symbol, interval, range_)
+            log_event(
+                "debug.compare.request.success",
+                symbol=payload.get("symbol"),
+                interval=payload.get("interval"),
+                bars=payload.get("bars"),
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
+            self._send_json({"ok": True, "data": payload})
+        except ValueError as exc:
+            log_event(
+                "debug.compare.request.error",
+                "warning",
+                symbol=symbol,
+                interval=interval,
+                error=str(exc),
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
+            self._send_json({"ok": False, "error": str(exc)}, status=400)
+        except Exception as exc:
+            log_event(
+                "debug.compare.request.error",
+                "error",
+                symbol=symbol,
+                interval=interval,
+                error=str(exc),
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
+            self._send_json({"ok": False, "error": str(exc)}, status=500)
 
     def _handle_kite_callback(self, query: str) -> None:
         params = urllib.parse.parse_qs(query)
@@ -4333,6 +5037,7 @@ def run_server(host: str, port: int) -> None:
     ensure_events_table()
     start_oi_baseline_scheduler()
     start_signal_scanner_scheduler()
+    start_mock_strategy_scheduler()
     server = ThreadingHTTPServer((host, port), RatingsHandler)
     log_event(
         "server.start",
@@ -4352,6 +5057,13 @@ def run_server(host: str, port: int) -> None:
         signal_scanner_intervals=background_signal_scanner_intervals(),
         signal_scanner_range=background_signal_scanner_range(),
         signal_scanner_poll_seconds=background_signal_scanner_poll_seconds(),
+        mock_strategy_enabled=mock_strategy_enabled(),
+        mock_strategy_thread_started=MOCK_STRATEGY_THREAD_STARTED,
+        mock_strategy_symbols=mock_strategy_symbols(),
+        mock_strategy_entry_after="%02d:%02d" % mock_strategy_entry_after(),
+        mock_strategy_square_off="%02d:%02d" % mock_strategy_square_off(),
+        mock_strategy_poll_seconds=mock_strategy_poll_seconds(),
+        mock_strategy_fixed_delta=mock_strategy_fixed_delta(),
     )
     print(f"Technical Ratings app running at http://{host}:{port}")
     if LOG_FILE_PATH:

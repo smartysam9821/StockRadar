@@ -1,5 +1,6 @@
 data/kite_access_token.json
 data/kite_instruments.csv
+data/backtests/
 data/*.log
 .env
 server.out.log

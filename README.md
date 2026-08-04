@@ -236,6 +236,93 @@ How it works:
 
 Change `OI_BASELINE_UNDERLYINGS` if the NIFTY 50 constituents change or if you want a smaller watchlist. This requires `DATABASE_URL`, a valid Kite session, and the app process running at or after the capture time.
 
+## Mock Options Backtest
+
+`backtest_engine.py` runs a research-only NSE index-options mock strategy using historical option-chain snapshots plus spot/VWAP data. It does not place real orders.
+
+Default assumptions:
+
+- Intraday only: entries start at `11:30`, open positions square off at `15:20`.
+- Strike window is dynamic calendar DTE: `N = expiry_date - trading_date`, selecting `N` strikes below ATM, ATM, and `N` strikes above ATM.
+- PCR bias uses selected strikes only: bullish above `1.10`, bearish below `0.90`.
+- Entry buys CE for bullish bias and PE for bearish bias, selecting the strike closest to underlying VWAP.
+- Delta targets use nearest bucket: `0.3 -> 30/20`, `0.4 -> 40/25`, `0.5 -> 50/30` target/SL premium points.
+- If delta is missing, the engine uses a simple moneyness fallback for bucket selection.
+- One trade per day by default, no re-entry.
+
+Input files can be CSV or JSON. Option-chain snapshots require:
+
+```text
+timestamp, expiry, strike, option_type, ltp, change_oi
+```
+
+Optional option-chain columns:
+
+```text
+oi, delta, iv, symbol, tradingsymbol
+```
+
+Spot data requires:
+
+```text
+timestamp, spot
+```
+
+Optional spot columns:
+
+```text
+vwap, open, high, low, close, volume
+```
+
+If `vwap` is missing and OHLCV is present, the engine computes running intraday VWAP. If volume is unavailable, it falls back to an expanding average of spot.
+
+Run:
+
+```powershell
+python backtest_engine.py `
+  --option-chain data/history/nifty_options.csv `
+  --spot data/history/nifty_spot.csv `
+  --symbol NIFTY `
+  --out data/backtests/nifty_pcr_vwap `
+  --sqlite data/backtests/backtests.sqlite
+```
+
+Outputs:
+
+- `mock_trades.csv`: every simulated trade with entry/exit, PCR context, delta bucket, exit reason, and PnL.
+- `metrics.json`: win rate, total PnL, average PnL, max drawdown, largest win/loss, holding time, and grouped performance.
+- SQLite tables: `backtest_runs` and `mock_trades`.
+
+## Live Mock Strategy
+
+StockRadar can also run the PCR + VWAP strategy as a live paper-trading process. This process never places real orders. It polls Kite option-chain quotes, simulates entries/exits, and stores mock trades in PostgreSQL.
+
+Enable it in `.env`:
+
+```env
+MOCK_STRATEGY_ENABLED=true
+MOCK_STRATEGY_SYMBOLS=NIFTY 50
+MOCK_STRATEGY_ENTRY_AFTER=11:30
+MOCK_STRATEGY_SQUARE_OFF=15:20
+MOCK_STRATEGY_POLL_SECONDS=60
+MOCK_STRATEGY_PCR_UPPER=1.10
+MOCK_STRATEGY_PCR_LOWER=0.90
+MOCK_STRATEGY_FIXED_DELTA=0.3
+MOCK_STRATEGY_LOT_SIZE=75
+```
+
+Runtime behavior:
+
+- Skips weekends.
+- Does not enter before `MOCK_STRATEGY_ENTRY_AFTER`.
+- Force-closes open positions at `MOCK_STRATEGY_SQUARE_OFF` with `exit_reason = EOD`.
+- Uses `MOCK_STRATEGY_FIXED_DELTA=0.3`, so target is `30` premium points and SL is `20` premium points.
+- Uses the selected strike window from the live option chain and computes PCR from `Change in OI`.
+- Stores open paper positions in `mock_strategy_positions`.
+- Stores completed paper trades in `mock_strategy_trades`.
+
+Before the process can work, Kite must be logged in and a same-day OI baseline must exist so `Change in OI` is not zero. Use the scheduled OI baseline capture or click `Capture OI Baseline` in the Option Chain screen after Kite login.
+
 ## Accuracy Notes
 
 The calculation follows TradingView's public Technical Ratings rules: 15 moving-average components, 11 oscillator components, each component contributing `-1`, `0`, or `+1`. The gauge thresholds are:
