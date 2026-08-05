@@ -27,7 +27,7 @@ KITE_API_SECRET=your_kite_api_secret
 APP_COOKIE_SECURE=false
 APP_ALLOW_HTTP_CSV=false
 TRADINGVIEW_CONFIRMATION_ENABLED=true
-TRADINGVIEW_CONFIRMATION_TTL_SECONDS=300
+TRADINGVIEW_CONFIRMATION_TTL_SECONDS=60
 STOCKRADAR_LOG_LEVEL=INFO
 STOCKRADAR_LOG_TO_FILE=true
 # DATABASE_URL=postgresql://user:password@host:5432/database
@@ -133,10 +133,10 @@ The UI is updated only when TradingView returns the same extreme on all three gr
 
 ```env
 TRADINGVIEW_CONFIRMATION_ENABLED=true
-TRADINGVIEW_CONFIRMATION_TTL_SECONDS=300
+TRADINGVIEW_CONFIRMATION_TTL_SECONDS=60
 ```
 
-Increase `TRADINGVIEW_CONFIRMATION_TTL_SECONDS` if you want fewer TradingView requests during auto-refresh.
+The default TradingView confirmation cache is 60 seconds. Increase `TRADINGVIEW_CONFIRMATION_TTL_SECONDS` if you want fewer TradingView requests during auto-refresh.
 
 ## Background Signal Scanner
 

@@ -269,8 +269,8 @@ def tradingview_confirmation_enabled() -> bool:
 
 def tradingview_cache_ttl_seconds() -> int:
     return parse_int(
-        os.environ.get("TRADINGVIEW_CONFIRMATION_TTL_SECONDS", "300"),
-        default=300,
+        os.environ.get("TRADINGVIEW_CONFIRMATION_TTL_SECONDS", "60"),
+        default=60,
         minimum=60,
         maximum=3600,
     )
