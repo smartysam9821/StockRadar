@@ -24,7 +24,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import numpy as np
-from kiteconnect import KiteConnect
+from kiteconnect import KiteConnect, KiteTicker
 try:
     import psycopg
 except ImportError:  # Optional PostgreSQL event sink.
@@ -136,6 +136,14 @@ TRADINGVIEW_SYMBOL_ALIASES = {
 TOKEN_LOCK = threading.RLock()
 INSTRUMENT_LOCK = threading.RLock()
 INSTRUMENT_CACHE_FRAME: pd.DataFrame | None = None
+KITE_TICKER_LOCK = threading.RLock()
+KITE_TICKER: KiteTicker | None = None
+KITE_TICKER_STARTED = False
+KITE_TICKER_CONNECTED = False
+KITE_TICKER_ACCESS_TOKEN = ""
+KITE_TICKER_SUBSCRIBED_TOKENS: set[int] = set()
+KITE_TICKER_TOKEN_KEYS: dict[int, str] = {}
+KITE_TICK_CACHE: dict[int, dict] = {}
 REQUEST_CONTEXT = threading.local()
 DB_LOCK = threading.RLock()
 DB_READY = False
@@ -288,6 +296,14 @@ def tradingview_cache_ttl_seconds() -> int:
         minimum=60,
         maximum=3600,
     )
+
+
+def kite_websocket_enabled() -> bool:
+    return os.environ.get("KITE_WEBSOCKET_ENABLED", "true").lower() in {"1", "true", "yes"}
+
+
+def kite_websocket_tick_max_age_seconds() -> int:
+    return parse_int(os.environ.get("KITE_WEBSOCKET_TICK_MAX_AGE_SECONDS", "10"), 10, 1, 300)
 
 
 def oi_baseline_enabled() -> bool:
@@ -494,6 +510,7 @@ def fetch_kite_ohlcv(symbol: str, interval: str = "5m", range_: str = "2y") -> p
 
     exchange, tradingsymbol = normalize_kite_symbol(symbol)
     instrument_token = get_kite_instrument_token(exchange, tradingsymbol)
+    subscribe_kite_websocket_symbol(exchange, tradingsymbol, instrument_token)
     source_interval = kite_source_interval(interval)
     from_dt, to_dt = kite_date_window(interval, range_)
     try:
@@ -506,6 +523,7 @@ def fetch_kite_ohlcv(symbol: str, interval: str = "5m", range_: str = "2y") -> p
         df = pd.concat(chunks, ignore_index=True).drop_duplicates(subset=["Date"]).sort_values("Date")
         df = df.reset_index(drop=True)
         df = completed_regular_session_candles(df, interval)
+        df = apply_live_tick_to_ohlcv(df, interval, instrument_token)
         log_event(
             "kite.ohlcv.success",
             symbol=f"{exchange}:{tradingsymbol}",
@@ -529,6 +547,9 @@ def fetch_kite_ohlcv(symbol: str, interval: str = "5m", range_: str = "2y") -> p
 
 
 def fetch_kite_last_price(symbol: str) -> float | None:
+    websocket_price = kite_websocket_last_price(symbol)
+    if websocket_price is not None:
+        return websocket_price
     exchange, tradingsymbol = normalize_kite_symbol(symbol)
     quote_key = f"{exchange}:{tradingsymbol}"
     kite = kite_client()
@@ -609,6 +630,7 @@ def exchange_kite_request_token(request_token: str) -> dict:
         raise ValueError("Kite token exchange succeeded but no access_token returned.")
     KITE_ACCESS_TOKEN_MEMORY = access_token
     save_kite_access_token(access_token)
+    ensure_kite_websocket_started()
     log_event("kite.login.exchange.success", duration_ms=int((time.perf_counter() - started) * 1000))
     return payload
 
@@ -620,6 +642,126 @@ def kite_client(access_token: str | None = None) -> KiteConnect:
         raise ValueError("Missing KITE_API_KEY env var.")
     token = access_token if access_token is not None else current_kite_access_token()
     return KiteConnect(api_key=api_key, access_token=token or None, timeout=30)
+
+
+def kite_websocket_on_ticks(ws: KiteTicker, ticks: list[dict]) -> None:
+    received_at = time.time()
+    with KITE_TICKER_LOCK:
+        for tick in ticks:
+            token = tick.get("instrument_token")
+            last_price = tick.get("last_price")
+            if token is None or last_price is None:
+                continue
+            token_int = int(token)
+            KITE_TICK_CACHE[token_int] = {
+                **tick,
+                "instrument_token": token_int,
+                "last_price": float(last_price),
+                "received_at": received_at,
+                "symbol": KITE_TICKER_TOKEN_KEYS.get(token_int, ""),
+            }
+
+
+def kite_websocket_on_connect(ws: KiteTicker, response: object) -> None:
+    global KITE_TICKER_CONNECTED
+    with KITE_TICKER_LOCK:
+        KITE_TICKER_CONNECTED = True
+        tokens = sorted(KITE_TICKER_SUBSCRIBED_TOKENS)
+    if tokens:
+        ws.subscribe(tokens)
+        ws.set_mode(ws.MODE_LTP, tokens)
+    log_event("kite.websocket.connected", subscribed_tokens=len(tokens))
+
+
+def kite_websocket_on_close(ws: KiteTicker, code: object, reason: object) -> None:
+    global KITE_TICKER_CONNECTED
+    with KITE_TICKER_LOCK:
+        KITE_TICKER_CONNECTED = False
+    log_event("kite.websocket.closed", "warning", code=code, reason=reason)
+
+
+def kite_websocket_on_error(ws: KiteTicker, code: object, reason: object) -> None:
+    log_event("kite.websocket.error", "warning", code=code, reason=reason)
+
+
+def ensure_kite_websocket_started() -> bool:
+    global KITE_TICKER, KITE_TICKER_STARTED, KITE_TICKER_CONNECTED, KITE_TICKER_ACCESS_TOKEN
+    if not kite_websocket_enabled():
+        return False
+    api_key = os.environ.get("KITE_API_KEY", "").strip()
+    access_token = current_kite_access_token()
+    if not api_key or not access_token:
+        return False
+    with KITE_TICKER_LOCK:
+        if KITE_TICKER_STARTED and KITE_TICKER_ACCESS_TOKEN == access_token:
+            return True
+        if KITE_TICKER is not None:
+            try:
+                KITE_TICKER.close()
+            except Exception:
+                pass
+        ticker = KiteTicker(api_key, access_token, reconnect=True, reconnect_max_tries=50, reconnect_max_delay=60)
+        ticker.on_ticks = kite_websocket_on_ticks
+        ticker.on_connect = kite_websocket_on_connect
+        ticker.on_close = kite_websocket_on_close
+        ticker.on_error = kite_websocket_on_error
+        KITE_TICKER = ticker
+        KITE_TICKER_STARTED = True
+        KITE_TICKER_CONNECTED = False
+        KITE_TICKER_ACCESS_TOKEN = access_token
+    try:
+        ticker.connect(threaded=True)
+        log_event("kite.websocket.start", reconnect=True)
+        return True
+    except Exception as exc:
+        with KITE_TICKER_LOCK:
+            KITE_TICKER_STARTED = False
+            KITE_TICKER_CONNECTED = False
+        log_event("kite.websocket.start_error", "warning", error=str(exc))
+        return False
+
+
+def subscribe_kite_websocket_symbol(exchange: str, tradingsymbol: str, instrument_token: int) -> None:
+    if not kite_websocket_enabled():
+        return
+    if not ensure_kite_websocket_started():
+        return
+    token = int(instrument_token)
+    quote_key = f"{exchange}:{tradingsymbol}"
+    with KITE_TICKER_LOCK:
+        KITE_TICKER_TOKEN_KEYS[token] = quote_key
+        already_subscribed = token in KITE_TICKER_SUBSCRIBED_TOKENS
+        KITE_TICKER_SUBSCRIBED_TOKENS.add(token)
+        ticker = KITE_TICKER
+        connected = KITE_TICKER_CONNECTED
+    if ticker is not None and connected and not already_subscribed:
+        try:
+            ticker.subscribe([token])
+            ticker.set_mode(ticker.MODE_LTP, [token])
+            log_event("kite.websocket.subscribe", symbol=quote_key, instrument_token=token)
+        except Exception as exc:
+            log_event("kite.websocket.subscribe_error", "warning", symbol=quote_key, instrument_token=token, error=str(exc))
+
+
+def kite_websocket_tick(instrument_token: int) -> dict | None:
+    max_age = kite_websocket_tick_max_age_seconds()
+    with KITE_TICKER_LOCK:
+        tick = dict(KITE_TICK_CACHE.get(int(instrument_token), {}))
+    if not tick:
+        return None
+    age = time.time() - float(tick.get("received_at", 0))
+    if age > max_age:
+        return None
+    tick["age_seconds"] = age
+    return tick
+
+
+def kite_websocket_last_price(symbol: str) -> float | None:
+    exchange, tradingsymbol = normalize_kite_symbol(symbol)
+    instrument_token = get_kite_instrument_token(exchange, tradingsymbol)
+    subscribe_kite_websocket_symbol(exchange, tradingsymbol, instrument_token)
+    tick = kite_websocket_tick(instrument_token)
+    return float(tick["last_price"]) if tick and tick.get("last_price") is not None else None
 
 
 def normalize_kite_symbol(symbol: str) -> tuple[str, str]:
@@ -688,6 +830,63 @@ def completed_regular_session_candles(df: pd.DataFrame, interval: str) -> pd.Dat
             last_output=str(filtered["Date"].iloc[-1]),
         )
     return filtered.reset_index(drop=True)
+
+
+def current_session_candle_start(now: datetime, interval: str) -> datetime | None:
+    minutes = interval_minutes(interval)
+    if minutes <= 0:
+        return None
+    session_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    session_end = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    if not (session_start <= now < session_end):
+        return None
+    elapsed_minutes = int((now - session_start).total_seconds() // 60)
+    bucket_minutes = (elapsed_minutes // minutes) * minutes
+    return session_start + timedelta(minutes=bucket_minutes)
+
+
+def apply_live_tick_to_ohlcv(df: pd.DataFrame, interval: str, instrument_token: int) -> pd.DataFrame:
+    tick = kite_websocket_tick(instrument_token)
+    if df.empty or not tick:
+        return df
+    now = market_now_naive().replace(microsecond=0)
+    candle_start = current_session_candle_start(now, interval)
+    if candle_start is None:
+        return df
+    ltp = float(tick["last_price"])
+    updated = df.copy()
+    updated["Date"] = pd.to_datetime(updated["Date"], errors="coerce").dt.tz_localize(None)
+    last_index = updated.index[-1]
+    last_date = updated.at[last_index, "Date"]
+    if pd.isna(last_date):
+        return df
+    if last_date < candle_start:
+        previous_close = float(updated.at[last_index, "Close"])
+        new_row = {
+            "Date": candle_start,
+            "Open": previous_close,
+            "High": max(previous_close, ltp),
+            "Low": min(previous_close, ltp),
+            "Close": ltp,
+            "Volume": 0,
+        }
+        updated = pd.concat([updated, pd.DataFrame([new_row])], ignore_index=True)
+        action = "append"
+    else:
+        updated.at[last_index, "High"] = max(float(updated.at[last_index, "High"]), ltp)
+        updated.at[last_index, "Low"] = min(float(updated.at[last_index, "Low"]), ltp)
+        updated.at[last_index, "Close"] = ltp
+        action = "update"
+    log_event(
+        "kite.websocket.candle_applied",
+        instrument_token=int(instrument_token),
+        interval=interval,
+        action=action,
+        ltp=ltp,
+        tick_age_seconds=round(float(tick.get("age_seconds", 0)), 3),
+        candle_start=candle_start.isoformat(sep=" "),
+    )
+    return updated
 
 
 def fetch_kite_historical_chunks(
@@ -2881,6 +3080,11 @@ class RatingsHandler(BaseHTTPRequestHandler):
             "ok": True,
             "market_timezone": str(MARKET_TIMEZONE),
             "market_now": market_now().isoformat(timespec="seconds"),
+            "kite_websocket_enabled": kite_websocket_enabled(),
+            "kite_websocket_started": KITE_TICKER_STARTED,
+            "kite_websocket_connected": KITE_TICKER_CONNECTED,
+            "kite_websocket_subscribed_tokens": len(KITE_TICKER_SUBSCRIBED_TOKENS),
+            "kite_websocket_cached_ticks": len(KITE_TICK_CACHE),
             "data_dir": str(DATA_DIR),
             "log_file": str(LOG_FILE_PATH) if LOG_FILE_PATH else "",
             "tradingview_confirmation": tradingview_confirmation_enabled(),
@@ -5116,6 +5320,7 @@ load().catch(showError);
 def run_server(host: str, port: int) -> None:
     validate_runtime_config(host)
     ensure_events_table()
+    ensure_kite_websocket_started()
     start_oi_baseline_scheduler()
     start_signal_scanner_scheduler()
     start_mock_strategy_scheduler()
@@ -5126,6 +5331,10 @@ def run_server(host: str, port: int) -> None:
         port=port,
         market_timezone=str(MARKET_TIMEZONE),
         market_now=market_now().isoformat(timespec="seconds"),
+        kite_websocket_enabled=kite_websocket_enabled(),
+        kite_websocket_started=KITE_TICKER_STARTED,
+        kite_websocket_connected=KITE_TICKER_CONNECTED,
+        kite_websocket_subscribed_tokens=len(KITE_TICKER_SUBSCRIBED_TOKENS),
         data_dir=str(DATA_DIR),
         log_to_file=os.environ.get("STOCKRADAR_LOG_TO_FILE", "true"),
         log_file=str(LOG_FILE_PATH) if LOG_FILE_PATH else "",

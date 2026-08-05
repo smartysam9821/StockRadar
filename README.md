@@ -25,6 +25,8 @@ APP_SESSION_SECRET=replace-with-a-generated-random-secret
 KITE_API_KEY=your_kite_api_key
 KITE_API_SECRET=your_kite_api_secret
 MARKET_TIMEZONE=Asia/Kolkata
+KITE_WEBSOCKET_ENABLED=true
+KITE_WEBSOCKET_TICK_MAX_AGE_SECONDS=10
 APP_COOKIE_SECURE=false
 APP_ALLOW_HTTP_CSV=false
 TRADINGVIEW_CONFIRMATION_ENABLED=true
@@ -69,6 +71,21 @@ If you already have an access token, set it directly:
 
 ```env
 KITE_ACCESS_TOKEN=your_daily_access_token
+```
+
+## Kite Websocket
+
+The gauge endpoint still fetches historical candles from Kite REST, then subscribes the selected instrument to Kite WebSocket. When a fresh tick is available, the app patches the current NSE session candle with the websocket LTP before calculating the gauge.
+
+```env
+KITE_WEBSOCKET_ENABLED=true
+KITE_WEBSOCKET_TICK_MAX_AGE_SECONDS=10
+```
+
+Useful logs:
+
+```bash
+grep -a "kite.websocket" ./data/stockradar.log | tail -50
 ```
 
 ## CLI
