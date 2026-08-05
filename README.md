@@ -24,6 +24,7 @@ APP_PASSWORD=use-a-strong-password
 APP_SESSION_SECRET=replace-with-a-generated-random-secret
 KITE_API_KEY=your_kite_api_key
 KITE_API_SECRET=your_kite_api_secret
+MARKET_TIMEZONE=Asia/Kolkata
 APP_COOKIE_SECURE=false
 APP_ALLOW_HTTP_CSV=false
 TRADINGVIEW_CONFIRMATION_ENABLED=true
@@ -333,4 +334,4 @@ The calculation follows TradingView's public Technical Ratings rules: 15 moving-
 - `(0.1, 0.5]`: Buy
 - `> 0.5`: Strong Buy
 
-Exact values can differ from TradingView if the OHLCV source, exchange session, corporate-action adjustment, intraday realtime bar, or timezone differs. Live fetch now uses Kite Connect historical candles. You can still use CSV input for testing or offline runs.
+Exact values can differ from TradingView if the OHLCV source, exchange session, corporate-action adjustment, intraday realtime bar, or timezone differs. Runtime market scheduling and trading dates use `MARKET_TIMEZONE=Asia/Kolkata` by default, so US-hosted Docker/server deployments still follow NSE time. Live fetch now uses Kite Connect historical candles. You can still use CSV input for testing or offline runs.

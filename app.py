@@ -20,6 +20,7 @@ from http import cookies
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import numpy as np
@@ -59,6 +60,7 @@ def load_env_file(path: Path = ENV_FILE) -> None:
 
 load_env_file()
 
+MARKET_TIMEZONE = ZoneInfo(os.environ.get("MARKET_TIMEZONE", "Asia/Kolkata"))
 DATA_DIR = Path(os.environ.get("STOCKRADAR_DATA_DIR", BASE_DIR / "data")).resolve()
 KITE_INSTRUMENT_CACHE = DATA_DIR / "kite_instruments.csv"
 KITE_TOKEN_FILE = DATA_DIR / "kite_access_token.json"
@@ -170,13 +172,25 @@ def configure_logging() -> logging.Logger:
 LOGGER = configure_logging()
 
 
+def market_now() -> datetime:
+    return datetime.now(MARKET_TIMEZONE)
+
+
+def market_now_naive() -> datetime:
+    return market_now().replace(tzinfo=None)
+
+
+def market_today() -> object:
+    return market_now().date()
+
+
 def current_request_id() -> str:
     return str(getattr(REQUEST_CONTEXT, "request_id", "") or "")
 
 
 def log_event(event: str, level: str = "info", **fields: object) -> None:
     payload = {
-        "ts": datetime.now().isoformat(timespec="milliseconds"),
+        "ts": market_now().isoformat(timespec="milliseconds"),
         "event": event,
         "request_id": current_request_id(),
         **fields,
@@ -551,7 +565,7 @@ def load_saved_kite_access_token() -> str:
             return ""
     token = str(payload.get("access_token", "")).strip()
     saved_date = str(payload.get("date", "")).strip()
-    if saved_date and saved_date != datetime.now().date().isoformat():
+    if saved_date and saved_date != market_today().isoformat():
         return ""
     return token
 
@@ -559,8 +573,8 @@ def load_saved_kite_access_token() -> str:
 def save_kite_access_token(access_token: str) -> None:
     payload = {
         "access_token": access_token,
-        "date": datetime.now().date().isoformat(),
-        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "date": market_today().isoformat(),
+        "saved_at": market_now().isoformat(timespec="seconds"),
     }
     with TOKEN_LOCK:
         KITE_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -637,7 +651,7 @@ def kite_source_interval(interval: str) -> str:
 
 
 def kite_date_window(interval: str, requested_range: str) -> tuple[datetime, datetime]:
-    to_dt = datetime.now().replace(microsecond=0)
+    to_dt = market_now_naive().replace(microsecond=0)
     minimum_days = {
         "5m": 30,
         "15m": 75,
@@ -654,7 +668,7 @@ def completed_regular_session_candles(df: pd.DataFrame, interval: str) -> pd.Dat
     minutes = interval_minutes(interval)
     if df.empty or minutes <= 0:
         return df
-    now = datetime.now().replace(microsecond=0)
+    now = market_now_naive().replace(microsecond=0)
     dates = pd.to_datetime(df["Date"], errors="coerce")
     times = dates.dt.time
     regular_session = (times >= datetime.strptime("09:15", "%H:%M").time()) & (
@@ -849,7 +863,7 @@ def fetch_option_chain(symbol: str, expiry: str = "", strikes_each_side: int = 8
 
     options["expiry"] = pd.to_datetime(options["expiry"]).dt.date
     expiries = sorted(options["expiry"].dropna().unique())
-    today = datetime.now().date()
+    today = market_today()
     future_expiries = [item for item in expiries if item >= today]
     if not future_expiries:
         raise ValueError(f"No active option expiries found for {underlying}.")
@@ -873,7 +887,7 @@ def fetch_option_chain(symbol: str, expiry: str = "", strikes_each_side: int = 8
     chain = expiry_chain[expiry_chain["strike"].isin(selected_strikes)]
 
     all_symbols = [str(row.tradingsymbol) for row in expiry_chain.itertuples()]
-    previous_oi = load_kite_oi_baselines(all_symbols, datetime.now().date())
+    previous_oi = load_kite_oi_baselines(all_symbols, market_today())
     keys = [f"NFO:{symbol}" for symbol in all_symbols]
     quotes = kite_quote_snapshot(keys)
     totals = full_expiry_option_totals(expiry_chain, previous_oi, quotes)
@@ -891,7 +905,7 @@ def fetch_option_chain(symbol: str, expiry: str = "", strikes_each_side: int = 8
         "option_underlying": option_underlying,
         "spot": spot,
         "vwap": spot_snapshot.get("average_price"),
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "timestamp": market_now().isoformat(timespec="seconds"),
         "expiry": selected_expiry.isoformat(),
         "expiries": [item.isoformat() for item in future_expiries[:12]],
         "totals": totals,
@@ -1632,7 +1646,7 @@ def save_kite_option_oi_baseline_for_chain(symbol: str, expiry: str = "") -> dic
     if not ensure_events_table():
         return {"rows": 0, "symbol": validate_symbol(symbol), "expiry": expiry, "source": "kite.quote.manual"}
     started = time.perf_counter()
-    trade_date = datetime.now().date()
+    trade_date = market_today()
     rows, option_underlying, selected_expiry = kite_option_oi_rows_for_chain(symbol, expiry, trade_date)
     log_event(
         "option_oi_baseline.manual_capture.start",
@@ -1653,7 +1667,7 @@ def save_kite_option_oi_baseline_for_chain(symbol: str, expiry: str = "") -> dic
 
 
 def save_latest_option_oi_baseline(max_trade_date: object | None = None) -> int:
-    trade_date = pd.to_datetime(max_trade_date or datetime.now().date()).date()
+    trade_date = pd.to_datetime(max_trade_date or market_today()).date()
     if option_oi_baseline_exists(trade_date):
         log_event("option_oi_baseline.skip", trade_date=str(trade_date), reason="already_exists", source="kite.quote.opening")
         return 0
@@ -1661,7 +1675,7 @@ def save_latest_option_oi_baseline(max_trade_date: object | None = None) -> int:
 
 
 def oi_baseline_due_now() -> bool:
-    now = datetime.now()
+    now = market_now()
     if now.weekday() >= 5:
         return False
     hour, minute = oi_baseline_capture_time()
@@ -1679,7 +1693,7 @@ def oi_baseline_scheduler_loop() -> None:
     )
     while True:
         try:
-            today = datetime.now().date()
+            today = market_today()
             if oi_baseline_enabled() and database_enabled() and oi_baseline_due_now():
                 save_latest_option_oi_baseline(today)
         except Exception as exc:
@@ -1799,7 +1813,7 @@ def mock_strategy_open_position(symbol: str) -> dict | None:
                 ORDER BY entry_time DESC
                 LIMIT 1
                 """,
-                (symbol, datetime.now().date()),
+                (symbol, market_today()),
             )
             row = cur.fetchone()
     if not row:
@@ -1826,7 +1840,7 @@ def mock_strategy_trade_count(symbol: str, trade_date: object) -> int:
 
 
 def mock_strategy_entry_snapshot(chain: dict) -> dict | None:
-    trade_date = datetime.now().date()
+    trade_date = market_today()
     expiry = pd.to_datetime(chain["expiry"]).date()
     dte = max(0, (expiry - trade_date).days)
     rows = chain.get("rows", [])
@@ -1894,7 +1908,7 @@ def mock_strategy_entry_snapshot(chain: dict) -> dict | None:
 
 def mock_strategy_insert_position(entry: dict) -> str:
     position_id = secrets.token_hex(16)
-    now = datetime.now()
+    now = market_now_naive()
     payload = {**entry, "expiry": entry["expiry"].isoformat(), "trade_date": entry["trade_date"].isoformat()}
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -1948,7 +1962,7 @@ def mock_strategy_current_premium(position: dict, chain: dict) -> tuple[float | 
 
 
 def mock_strategy_close_position(position: dict, exit_premium: float, reason: str, spot: float | None, vwap: float | None) -> None:
-    now = datetime.now()
+    now = market_now_naive()
     pnl_points = float(exit_premium) - float(position["entry_premium"])
     pnl_amount = pnl_points * mock_strategy_lot_size()
     holding_minutes = (now - position["entry_time"].replace(tzinfo=None)).total_seconds() / 60
@@ -2004,7 +2018,7 @@ def mock_strategy_close_position(position: dict, exit_premium: float, reason: st
 
 
 def mock_strategy_evaluate_symbol(symbol: str) -> None:
-    now = datetime.now()
+    now = market_now_naive()
     normalized_symbol = option_underlying_symbol(normalize_kite_symbol(symbol)[1])
     open_position = mock_strategy_open_position(normalized_symbol)
     chain = fetch_option_chain(symbol, strikes_each_side=25)
@@ -2800,6 +2814,8 @@ class RatingsHandler(BaseHTTPRequestHandler):
     def _handle_health(self) -> None:
         payload = {
             "ok": True,
+            "market_timezone": str(MARKET_TIMEZONE),
+            "market_now": market_now().isoformat(timespec="seconds"),
             "data_dir": str(DATA_DIR),
             "log_file": str(LOG_FILE_PATH) if LOG_FILE_PATH else "",
             "tradingview_confirmation": tradingview_confirmation_enabled(),
@@ -5043,6 +5059,8 @@ def run_server(host: str, port: int) -> None:
         "server.start",
         host=host,
         port=port,
+        market_timezone=str(MARKET_TIMEZONE),
+        market_now=market_now().isoformat(timespec="seconds"),
         data_dir=str(DATA_DIR),
         log_to_file=os.environ.get("STOCKRADAR_LOG_TO_FILE", "true"),
         log_file=str(LOG_FILE_PATH) if LOG_FILE_PATH else "",
