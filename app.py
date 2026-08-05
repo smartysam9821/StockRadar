@@ -1196,6 +1196,39 @@ def ensure_events_table() -> bool:
                     )
                     cur.execute(
                         """
+                        UPDATE mock_strategy_positions
+                        SET symbol = 'NIFTY'
+                        WHERE symbol = 'NIFTY 50'
+                        """
+                    )
+                    cur.execute(
+                        """
+                        WITH ranked_open AS (
+                            SELECT
+                                position_id,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY symbol, trade_date
+                                    ORDER BY entry_time DESC, position_id DESC
+                                ) AS row_number
+                            FROM mock_strategy_positions
+                            WHERE status = 'OPEN'
+                        )
+                        UPDATE mock_strategy_positions AS positions
+                        SET status = 'DUPLICATE_CLOSED'
+                        FROM ranked_open
+                        WHERE positions.position_id = ranked_open.position_id
+                            AND ranked_open.row_number > 1
+                        """
+                    )
+                    cur.execute(
+                        """
+                        CREATE UNIQUE INDEX IF NOT EXISTS idx_mock_positions_one_open_per_day
+                        ON mock_strategy_positions (symbol, trade_date)
+                        WHERE status = 'OPEN'
+                        """
+                    )
+                    cur.execute(
+                        """
                         CREATE TABLE IF NOT EXISTS mock_strategy_trades (
                             trade_id TEXT PRIMARY KEY,
                             position_id TEXT,
@@ -1231,6 +1264,13 @@ def ensure_events_table() -> bool:
                         """
                         CREATE INDEX IF NOT EXISTS idx_mock_trades_symbol_date
                         ON mock_strategy_trades (symbol, trade_date DESC)
+                        """
+                    )
+                    cur.execute(
+                        """
+                        UPDATE mock_strategy_trades
+                        SET symbol = 'NIFTY'
+                        WHERE symbol = 'NIFTY 50'
                         """
                     )
                     cur.execute(
@@ -1885,9 +1925,10 @@ def mock_strategy_entry_snapshot(chain: dict) -> dict | None:
     _, strike, side, _ = sorted(candidates, key=lambda item: (item[0], item[1]))[0]
     delta = mock_strategy_fixed_delta()
     bucket, target, sl = mock_strategy_target_sl(delta)
+    strategy_symbol = str(chain.get("option_underlying") or option_underlying_symbol(str(chain["symbol"]))).upper()
     return {
         "trade_date": trade_date,
-        "symbol": chain["symbol"],
+        "symbol": strategy_symbol,
         "expiry": expiry,
         "strike": strike,
         "option_type": option_type,
@@ -1907,6 +1948,15 @@ def mock_strategy_entry_snapshot(chain: dict) -> dict | None:
 
 
 def mock_strategy_insert_position(entry: dict) -> str:
+    existing = mock_strategy_open_position(str(entry["symbol"]))
+    if existing:
+        log_event(
+            "mock_strategy.position.open_skip",
+            symbol=entry["symbol"],
+            reason="open_position_exists",
+            position_id=existing["position_id"],
+        )
+        return str(existing["position_id"])
     position_id = secrets.token_hex(16)
     now = market_now_naive()
     payload = {**entry, "expiry": entry["expiry"].isoformat(), "trade_date": entry["trade_date"].isoformat()}
@@ -2027,11 +2077,26 @@ def mock_strategy_evaluate_symbol(symbol: str) -> None:
         if premium is None:
             log_event("mock_strategy.position.skip_exit", "warning", symbol=normalized_symbol, reason="premium_missing")
             return
+        target_price = float(open_position["entry_premium"]) + float(open_position["target_pts"])
+        sl_price = float(open_position["entry_premium"]) - float(open_position["sl_pts"])
+        log_event(
+            "mock_strategy.position.monitor",
+            symbol=normalized_symbol,
+            position_id=open_position["position_id"],
+            option_type=open_position["option_type"],
+            strike=open_position["strike"],
+            entry_premium=open_position["entry_premium"],
+            current_premium=premium,
+            target_price=target_price,
+            sl_price=sl_price,
+            spot=spot,
+            vwap=vwap,
+        )
         if mock_strategy_due_for_squareoff(now):
             mock_strategy_close_position(open_position, premium, "EOD", spot, vwap)
-        elif premium >= float(open_position["entry_premium"]) + float(open_position["target_pts"]):
+        elif premium >= target_price:
             mock_strategy_close_position(open_position, premium, "TARGET", spot, vwap)
-        elif premium <= float(open_position["entry_premium"]) - float(open_position["sl_pts"]):
+        elif premium <= sl_price:
             mock_strategy_close_position(open_position, premium, "SL", spot, vwap)
         return
 
